@@ -1,0 +1,40 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, bin: archive }
+          - { os: macos-13, target: x86_64-apple-darwin, bin: archive }
+          - { os: macos-latest, target: aarch64-apple-darwin, bin: archive }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, bin: archive.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo test --release --target ${{ matrix.target }}
+      - name: package
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} .
+          if [[ "${{ matrix.os }}" == windows-latest ]]; then
+            7z a archive-${{ matrix.target }}.zip ${{ matrix.bin }}
+          else
+            tar czf archive-${{ matrix.target }}.tar.gz ${{ matrix.bin }}
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: archive-${{ matrix.target }}.*
+          generate_release_notes: true

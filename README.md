@@ -6,6 +6,8 @@ The idea: an agent that greps reads whole files into its context. An agent with 
 
 ## Install
 
+Grab a binary from [releases](https://github.com/Lithial/the-archive/releases) (Linux, macOS Intel/Apple Silicon, Windows) and put it on your PATH, or build it:
+
 ```sh
 cargo install --git https://github.com/lithial/the-archive
 ```
