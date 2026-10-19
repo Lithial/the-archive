@@ -9,6 +9,9 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+#[cfg(feature = "honeybadger")]
+mod trace;
+
 const WINDOW: usize = 40; // lines per passage
 const STEP: usize = 30; // overlap of 10 lines so a hit at a boundary is not cut in half
 const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -71,6 +74,15 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Where a Honeybadger error comes from: reads a notice as JSON (file or stdin) and finds the
+    /// message and marker in the source, with drift since the deployed revision.
+    #[cfg(feature = "honeybadger")]
+    Trace {
+        #[arg(default_value = "-")]
+        notice: PathBuf,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -110,6 +122,14 @@ fn main() -> Result<()> {
         Cmd::Mcp { dir } => mcp(&dir)?,
         Cmd::Stats => stats()?,
         Cmd::Run { cmd } => std::process::exit(run(&cmd)?),
+        #[cfg(feature = "honeybadger")]
+        Cmd::Trace { notice, dir } => {
+            let text = if notice.as_os_str() == "-" { std::io::read_to_string(std::io::stdin())? } else { std::fs::read_to_string(&notice)? };
+            let t = Instant::now();
+            let out = trace::trace(&dir, &serde_json::from_str(&text).context("notice is not JSON")?)?;
+            log(&dir, "trace", "", t, std::iter::once(("-", out.len())))?;
+            println!("{out}");
+        }
     }
     Ok(())
 }
@@ -970,6 +990,14 @@ fn mcp(dir: &Path) -> Result<()> {
          "inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}},
         {"name":"reindex","description":"Rebuild the index after large edits.","inputSchema":{"type":"object","properties":{}}}
     ]);
+    #[cfg(feature = "honeybadger")]
+    let tools = {
+        let mut t = tools;
+        t.as_array_mut().unwrap().push(json!(
+            {"name":"trace","description":"Where a Honeybadger error comes from. First fetch a notice with the Honeybadger MCP (list_fault_notices, limit 1), then pass its JSON here. Returns the file:line that logs or throws the message, where the context marker is set, how far the deployed revision is behind HEAD and whether those lines changed since.",
+             "inputSchema":{"type":"object","properties":{"notice":{"description":"notice JSON (object or string)"}},"required":["notice"]}}));
+        t
+    };
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -1042,6 +1070,18 @@ fn call(dir: &Path, params: &Value) -> Result<String> {
             Ok(out)
         }
         "reindex" => Ok(format!("indexed {} files", index(dir)?)),
+        #[cfg(feature = "honeybadger")]
+        "trace" => {
+            let n = &args["notice"];
+            let n = match n.as_str() {
+                Some(s) => serde_json::from_str(s).context("notice is not JSON")?,
+                None => n.clone(),
+            };
+            let t = Instant::now();
+            let out = trace::trace(dir, &n)?;
+            log(dir, "trace", "", t, std::iter::once(("-", out.len())))?;
+            Ok(out)
+        }
         other => Err(anyhow!("unknown tool {other}")),
     }
 }

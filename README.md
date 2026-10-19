@@ -31,7 +31,7 @@ Hook it into Claude Code or Cursor by adding to `.mcp.json`:
 { "mcpServers": { "archive": { "command": "archive", "args": ["mcp", "--dir", "."] } } }
 ```
 
-Tools exposed: `search`, `def`, `refs`, `why`, `reindex`.
+Tools exposed: `search`, `def`, `refs`, `why`, `reindex`, plus `trace` when built with `--features honeybadger`.
 
 ### History
 
@@ -92,6 +92,40 @@ Passing-test lines, colour codes, progress-bar redraws and repeated lines are re
 On a vitest run in a real monorepo (9 failing suites, 1 failing assertion) this kept 68 of 213 lines, 5.7 KB of 15.3 KB, including the full expected/received diff.
 
 `run` is CLI-only on purpose. As an MCP tool it would let an agent run arbitrary commands without your harness's permission prompts.
+
+## Honeybadger errors (optional)
+
+Off by default. Build it in with:
+
+```sh
+cargo install --git https://github.com/lithial/the-archive --features honeybadger
+```
+
+`archive trace` takes a Honeybadger notice as JSON (a file, stdin, or the `notice` argument of the `trace` MCP tool) and says where it came from:
+
+```
+$ archive trace notice.json
+GraphQL error while fetching organizations and circles
+  production · 2026-10-13T14:37:30Z · https://my.circl.es/en · https://app.honeybadger.io/…
+  marker: useOrganizations
+  nested: ApolloError: unauthorized (×49)
+  deployed revision 8a1ca6a95 is 86 commits behind HEAD
+
+message found:
+  apps/my-circles/src/queries/useOrganizations.ts:49  logger.error("GraphQL error while fetching organizations and circles", { error });
+    changed since deploy (+13 -7); archive why apps/my-circles/src/queries/useOrganizations.ts:49
+  + 3 in tests
+marker "useOrganizations" set at:
+  apps/my-circles/src/queries/useOrganizations.ts:14  const { logger } = useLogger("useOrganizations");
+    changed since deploy (+13 -7); archive why apps/my-circles/src/queries/useOrganizations.ts:14
+frames (minified, no source maps):
+  0qa8_35mttvm7.js:1:51918 a
+  …
+```
+
+It finds the message with `git grep` (or its longest literal fragment when the message has ids or counts in it), and the context `marker` as a quoted string. It compares those files between the notice's `revision` and `HEAD`. Matches only in tests don't count, so a library error such as Apollo's `Response not successful` is reported as coming from a dependency.
+
+archive never talks to Honeybadger. The agent fetches the notice through the Honeybadger MCP (`list_fault_notices`, limit 1), which already has your OAuth login, so archive holds no token and makes no network calls. Frames stay minified: Honeybadger's API returns only the raw backtrace, and it has no endpoint to download uploaded source maps.
 
 ## Stats
 
