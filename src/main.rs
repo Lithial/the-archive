@@ -181,7 +181,12 @@ fn search(db: &Connection, query: &str, limit: usize) -> Result<Vec<Hit>> {
     }
     let q = terms.join(" OR ");
     let mut stmt = db.prepare(
-        "SELECT path, start, end, body, -bm25(chunks, 0, 0, 0, 1.0, 1.0) AS score
+        // Tests, stories and fixtures rank 0.8x so the implementation wins a tie.
+        "SELECT path, start, end, body,
+           -bm25(chunks, 0, 0, 0, 1.0, 1.0)
+             * CASE WHEN path GLOB '*.test.*' OR path GLOB '*.spec.*' OR path GLOB '*.stories.*'
+                      OR path GLOB '*__tests__*' OR path GLOB '*__mocks__*' OR path GLOB '*fixtures*'
+                    THEN 0.8 ELSE 1.0 END AS score
          FROM chunks WHERE chunks MATCH ?1 ORDER BY score DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![q, limit as i64], |r| {
