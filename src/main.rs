@@ -312,6 +312,7 @@ fn ts_language(p: &Path) -> Option<tree_sitter::Language> {
     match p.extension()?.to_str()? {
         "ts" | "mts" | "cts" | "js" | "mjs" | "cjs" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" | "jsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        "gd" => Some(tree_sitter_gdscript::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -331,6 +332,9 @@ fn symbols(src: &str, lang: tree_sitter::Language) -> Vec<Sym> {
             kind,
             "function_declaration" | "class_declaration" | "abstract_class_declaration" | "method_definition"
                 | "interface_declaration" | "type_alias_declaration" | "enum_declaration" | "variable_declarator"
+                // GDScript
+                | "class_name_statement" | "class_definition" | "function_definition" | "signal_statement" | "enum_definition"
+                | "variable_statement" | "const_statement"
         );
         if named {
             if let Some(name_node) = node.child_by_field_name("name") {
@@ -342,7 +346,10 @@ fn symbols(src: &str, lang: tree_sitter::Language) -> Vec<Sym> {
                     let text = &src[node.byte_range()];
                     out.push(Sym {
                         name: src[name_node.byte_range()].to_string(),
-                        kind: kind.trim_end_matches("_declaration").trim_end_matches("_declarator").replace('_', " "),
+                        kind: ["_declaration", "_declarator", "_definition", "_statement"]
+                            .iter()
+                            .fold(kind, |k, s| k.trim_end_matches(s))
+                            .replace('_', " "),
                         line: node.start_position().row + 1,
                         signature: text.lines().next().unwrap_or("").trim().chars().take(160).collect(),
                     });
@@ -446,5 +453,21 @@ mod tests {
         let mut names: Vec<_> = s.iter().map(|s| (s.name.as_str(), s.line)).collect();
         names.sort_by_key(|n| n.1);
         assert_eq!(names, vec![("Foo", 1), ("bar", 2), ("baz", 4), ("qux", 6)]);
+    }
+
+    #[test]
+    fn finds_gdscript_symbols() {
+        let src = "class_name Player\nextends Node\nsignal died(cause)\nenum State { IDLE }\nvar speed := 1\nconst MAX = 3\nfunc _ready():\n\tpass\nstatic func make() -> Player:\n\treturn null\nclass Inner:\n\tfunc hi():\n\t\tpass\n";
+        let s = symbols(src, tree_sitter_gdscript::LANGUAGE.into());
+        let mut got: Vec<_> = s.iter().map(|s| (s.name.as_str(), s.kind.as_str(), s.line)).collect();
+        got.sort_by_key(|g| g.2);
+        assert_eq!(
+            got,
+            vec![
+                ("Player", "class name", 1), ("died", "signal", 3), ("State", "enum", 4), ("speed", "variable", 5),
+                ("MAX", "const", 6), ("_ready", "function", 7), ("make", "function", 9), ("Inner", "class", 11),
+                ("hi", "function", 12),
+            ]
+        );
     }
 }
