@@ -309,8 +309,10 @@ fn open(dir: &Path) -> Result<Connection> {
         None => true,
         Some(built) => {
             let newer = |m: std::fs::Metadata| m.modified().map_or(true, |t| t > built);
-            // .archiveignore is a hidden file, so the walk skips it; check it directly.
-            std::fs::metadata(dir.join(".archiveignore")).map_or(false, newer)
+            // Hidden files and node_modules are outside the walk; check them directly.
+            // An install or upgrade rewrites a package's package.json.
+            [".archiveignore", ".archivedeps"].iter().any(|f| std::fs::metadata(dir.join(f)).map_or(false, newer))
+                || dep_dirs(dir).iter().any(|(d, _)| std::fs::metadata(d.join("package.json")).map_or(true, newer))
                 || walk(dir).any(|e| e.metadata().map_or(true, newer))
         }
     };
@@ -319,6 +321,52 @@ fn open(dir: &Path) -> Result<Connection> {
         eprintln!("archive: index was stale, rebuilt ({n} files)");
     }
     Ok(Connection::open(p)?)
+}
+
+/// Packages listed in `.archivedeps`, one per line, found in the `node_modules` next to any
+/// package.json in the repo, so each app's own copy (and version) is indexed.
+/// Returns (package dir, path relative to the repo root).
+fn dep_dirs(root: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(list) = std::fs::read_to_string(root.join(".archivedeps")) else { return vec![] };
+    let pkgs: Vec<&str> = list.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+    let mut out = vec![];
+    for e in walk(root).filter(|e| e.file_name() == "package.json") {
+        let ws = e.path().parent().unwrap_or(root);
+        for p in &pkgs {
+            let d = ws.join("node_modules").join(p);
+            if d.join("package.json").is_file() {
+                let rel = d.strip_prefix(root).unwrap_or(&d).to_string_lossy().into_owned();
+                out.push((d, rel));
+            }
+        }
+    }
+    out
+}
+
+/// Type declarations of one dependency, with the version from its package.json.
+fn index_dep(tx: &rusqlite::Transaction, dir: &Path, rel: &str) -> Result<usize> {
+    let pkg: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("package.json"))?)?;
+    let version = pkg["version"].as_str().unwrap_or("?");
+    let name = pkg["name"].as_str().unwrap_or(rel);
+    let mut n = 0;
+    // node_modules is gitignored, so walk it with ignore rules off; follow pnpm's symlinks
+    let files = ignore::WalkBuilder::new(dir).standard_filters(false).follow_links(true).build().filter_map(Result::ok);
+    for e in files {
+        let f = e.file_name().to_string_lossy();
+        if ![".d.ts", ".d.mts", ".d.cts"].iter().any(|x| f.ends_with(x)) || e.metadata().map_or(true, |m| m.len() > MAX_FILE_BYTES) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let path = format!("{rel}/{}", e.path().strip_prefix(dir)?.to_string_lossy());
+        for s in symbols(&text, tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()) {
+            tx.execute(
+                "INSERT INTO symbols VALUES(?1,?2,?3,?4,?5)",
+                params![s.name, format!("{} · {name}@{version}", s.kind), path, s.line, s.signature],
+            )?;
+        }
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// Respects .gitignore plus `.archiveignore` (same syntax) for things you track but don't want searched, like vendor code.
@@ -383,6 +431,9 @@ fn index(dir: &Path) -> Result<usize> {
             }
         }
         n += 1;
+    }
+    for (d, rel) in dep_dirs(&root) {
+        n += index_dep(&tx, &d, &rel)?;
     }
     tx.execute_batch(
         "DELETE FROM refs WHERE plain AND name NOT IN (SELECT name FROM symbols);
@@ -451,7 +502,8 @@ struct Def {
 fn def(db: &Connection, name: &str) -> Result<Vec<Def>> {
     let mut stmt = db.prepare(
         "SELECT path, line, kind, signature FROM symbols
-         WHERE name = ?1 OR name LIKE ?2 ORDER BY name = ?1 DESC, path LIMIT 20",
+         WHERE name = ?1 OR name LIKE ?2
+         ORDER BY name = ?1 DESC, path LIKE '%node_modules/%', path LIMIT 20",
     )?;
     let rows = stmt.query_map(params![name, format!("%{name}%")], |r| {
         Ok(Def { path: r.get(0)?, line: r.get(1)?, kind: r.get(2)?, signature: r.get(3)? })
@@ -529,12 +581,17 @@ fn symbols(src: &str, lang: tree_sitter::Language) -> Vec<Sym> {
             let text = &src[node.byte_range()];
             out.push(Sym {
                 name: src[name_node.byte_range()].to_string(),
-                kind: ["_declaration", "_declarator", "_definition", "_statement"]
+                kind: ["_declaration", "_declarator", "_definition", "_statement", "_signature"]
                     .iter()
                     .fold(node.kind(), |k, s| k.trim_end_matches(s))
                     .replace('_', " "),
                 line: node.start_position().row + 1,
-                signature: text.lines().next().unwrap_or("").trim().chars().take(160).collect(),
+                // A declaration without a body is all signature, often over several lines.
+                signature: if node.kind().ends_with("_signature") || node.kind() == "variable_declarator" && node.child_by_field_name("value").is_none() {
+                    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(400).collect()
+                } else {
+                    text.lines().next().unwrap_or("").trim().chars().take(160).collect()
+                },
             });
         }
         for child in node.children(&mut cursor) {
@@ -550,6 +607,8 @@ fn def_name(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
     let named = matches!(
         kind,
         "function_declaration" | "class_declaration" | "abstract_class_declaration" | "method_definition"
+            // bodiless forms: .d.ts files, overloads, interface methods
+            | "function_signature" | "method_signature"
             | "interface_declaration" | "type_alias_declaration" | "enum_declaration" | "variable_declarator"
             // GDScript
             | "class_name_statement" | "class_definition" | "function_definition" | "signal_statement" | "enum_definition"
@@ -558,8 +617,13 @@ fn def_name(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
     if !named {
         return None;
     }
+    // `declare const useStore: UseBoundStore<...>` in a .d.ts has a type and no value
     let is_fn_var = kind != "variable_declarator"
-        || node.child_by_field_name("value").map_or(false, |v| matches!(v.kind(), "arrow_function" | "function_expression" | "function"));
+        || node.child_by_field_name("value").map_or(
+            node.parent().and_then(|p| p.parent()).map_or(false, |g| g.kind() == "ambient_declaration"),
+            |v| {
+            matches!(v.kind(), "arrow_function" | "function_expression" | "function")
+        });
     is_fn_var.then(|| node.child_by_field_name("name")).flatten()
 }
 
@@ -765,6 +829,16 @@ mod tests {
                 ("Cache", 6, ""), ("User", 6, ""), ("fetchUser", 7, ""),
             ]
         );
+    }
+
+    #[test]
+    fn finds_dts_symbols() {
+        let src = "export declare function useQuery<T>(\n  query: DocumentNode,\n  options?: Opts<T>\n): Result<T>;\nexport declare const create: <T>() => Store<T>;\ninterface Client { query<T>(o: Q): Promise<T> }\n";
+        let s = symbols(src, tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into());
+        let find = |n: &str| s.iter().find(|s| s.name == n).unwrap_or_else(|| panic!("{n} missing"));
+        assert_eq!(find("useQuery").signature, "function useQuery<T>( query: DocumentNode, options?: Opts<T> ): Result<T>;");
+        assert!(find("create").signature.contains("Store<T>"));
+        assert!(find("query").signature.contains("Promise<T>"));
     }
 
     #[test]

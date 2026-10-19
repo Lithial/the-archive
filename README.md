@@ -33,6 +33,22 @@ Hook it into Claude Code or Cursor by adding to `.mcp.json`:
 
 Tools exposed: `search`, `def`, `refs`, `reindex`.
 
+### Dependency types
+
+List packages in `.archivedeps` at the repo root, one per line, and `def` also returns their type declarations, with the version actually installed:
+
+```
+$ cat .archivedeps
+@apollo/client
+zustand
+
+$ archive def create
+node_modules/zustand/react.d.ts:13  [variable · zustand@5.0.12] create: Create
+apps/my-circles/node_modules/zustand/react.d.ts:13  [variable · zustand@5.0.11] create: Create
+```
+
+Every `node_modules` next to a `package.json` is checked, so an app pinned to a different version shows up separately. Only `.d.ts` files are read, for `def`; they are left out of `search` and `refs` so library code does not outrank yours. Repo symbols sort before dependency symbols. An install or upgrade triggers a rebuild. It costs index time: @apollo/client and zustand took a 4k-file index from 6 s to 10 s.
+
 ## Condensed command output
 
 ```sh
