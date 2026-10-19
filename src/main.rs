@@ -50,6 +50,12 @@ enum Cmd {
     },
     /// Usage totals from ~/.cache/archive/log.jsonl: queries, latency, bytes returned vs whole files.
     Stats,
+    /// Run a command and print only what matters: errors with context, plus the summary at the end.
+    /// Full output goes to ~/.cache/archive/runs/. Exits with the command's exit code.
+    Run {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -76,8 +82,133 @@ fn main() -> Result<()> {
         }
         Cmd::Mcp { dir } => mcp(&dir)?,
         Cmd::Stats => stats()?,
+        Cmd::Run { cmd } => std::process::exit(run(&cmd)?),
     }
     Ok(())
+}
+
+// ---------- run: condensed command output ----------
+
+const SHORT: usize = 60; // output this short is shown as-is
+const TAIL: usize = 12; // summary lines ("Tests: 2 failed, 98 passed") live at the end
+const MAX_KEPT: usize = 200;
+
+fn run(cmd: &[String]) -> Result<i32> {
+    let t = Instant::now();
+    let dir = log_path()?.with_file_name("runs");
+    std::fs::create_dir_all(&dir)?;
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let path = dir.join(format!("{ts}-{}.log", std::process::id()));
+
+    // One pipe for stdout and stderr so errors stay next to the lines that caused them.
+    let (mut reader, writer) = std::io::pipe()?;
+    let mut child = std::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .stdout(writer.try_clone()?)
+        .stderr(writer)
+        .spawn()
+        .with_context(|| format!("could not run {}", cmd[0]))?;
+    std::io::copy(&mut reader, &mut std::fs::File::create(&path)?)?;
+    let code = child.wait()?.code().unwrap_or(1); // killed by a signal counts as failure
+
+    let raw = std::fs::read(&path)?;
+    let text = String::from_utf8_lossy(&raw);
+    let (out, kept, total) = condense(&text, code == 0);
+    println!("{out}");
+    println!("[archive run] exit {code} · kept {kept} of {total} lines · full log: {}", path.display());
+    append_log(json!({
+        "ts": ts, "dir": std::env::current_dir()?, "tool": "run", "query": cmd.join(" "),
+        "ms": t.elapsed().as_millis() as u64, "exit": code, "returned_bytes": out.len(), "file_bytes": raw.len(),
+    }))?;
+    Ok(code)
+}
+
+/// Returns (condensed text, lines kept, lines total).
+fn condense(text: &str, ok: bool) -> (String, usize, usize) {
+    let lines: Vec<String> = text.lines().map(clean_line).collect();
+    let n = lines.len();
+    if n <= SHORT {
+        return (lines.join("\n"), n, n);
+    }
+    let mut keep = vec![false; n];
+    if !ok {
+        for i in (0..n).filter(|&i| interesting(&lines[i])) {
+            keep[i.saturating_sub(1)..(i + 4).min(n)].fill(true);
+        }
+    }
+    keep[n - TAIL..].fill(true);
+
+    let mut out: Vec<&str> = vec![];
+    let mut seen = std::collections::HashSet::new();
+    let mut gap = false;
+    for (i, l) in lines.iter().enumerate() {
+        // Long lines repeat when a type error or warning hits many files; show each once.
+        let t = l.trim_start();
+        let passing = t.starts_with('✓') || t.starts_with('√') || t.starts_with("PASS ") || t.starts_with("ok ");
+        if !keep[i] || passing || l.trim().is_empty() || (l.len() >= 12 && !seen.insert(l.as_str())) {
+            gap |= !keep[i] || passing;
+            continue;
+        }
+        if gap && !out.is_empty() {
+            out.push("  …");
+        }
+        gap = false;
+        out.push(l);
+    }
+    let kept = out.iter().filter(|l| **l != "  …").count();
+    if out.len() > MAX_KEPT {
+        let cut = format!("  … {} more lines cut, see the full log", out.len() - MAX_KEPT);
+        let tail = out.split_off(out.len() - 30);
+        out.truncate(MAX_KEPT - 30);
+        return ([out.join("\n"), cut, tail.join("\n")].join("\n"), MAX_KEPT, n);
+    }
+    (out.join("\n"), kept, n)
+}
+
+/// Strips ANSI colour codes and keeps only the last carriage-return segment (progress bars).
+fn clean_line(l: &str) -> String {
+    let l = l.rsplit('\r').find(|s| !s.is_empty()).unwrap_or("");
+    let mut out = String::with_capacity(l.len());
+    let mut chars = l.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn interesting(l: &str) -> bool {
+    // Stack frames inside dependencies and the runtime are noise; frames in your code are not.
+    if l.contains("node_modules/") || l.contains("node:internal") || l.contains("/rustc/") {
+        return false;
+    }
+    // expected/received diff lines are the whole point of a failed assertion
+    let t = l.trim_start();
+    if t.starts_with("+ ") || t.starts_with("- ") {
+        return true;
+    }
+    let low = l.to_lowercase();
+    const WORDS: &[&str] = &["error", "fail", "panic", "exception", "assert", "expected", "received", "✕", "✗", "×", "● "];
+    if WORDS.iter().any(|w| low.contains(w)) {
+        return true;
+    }
+    // file:line or file(line,col) in source we care about
+    const EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".gd", ".py", ".go"];
+    EXTS.iter().any(|e| {
+        l.match_indices(e).any(|(i, _)| {
+            let rest = &l[i + e.len()..];
+            (rest.starts_with(':') || rest.starts_with('(')) && rest[1..].starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
 }
 
 // ---------- usage log ----------
@@ -97,48 +228,44 @@ fn log<'a>(dir: &Path, tool: &str, query: &str, start: Instant, hits: impl Itera
         files.insert(path.to_string());
     }
     let file_bytes: u64 = files.iter().filter_map(|p| std::fs::metadata(root.join(p)).ok()).map(|m| m.len()).sum();
-    let line = json!({
+    append_log(json!({
         "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
         "dir": root, "tool": tool, "query": query, "ms": start.elapsed().as_millis() as u64,
         "hits": files.len(), "returned_bytes": returned, "file_bytes": file_bytes,
-    });
+    }))
+}
+
+fn append_log(line: Value) -> Result<()> {
     let mut f = std::fs::OpenOptions::new().append(true).create(true).open(log_path()?)?;
     writeln!(f, "{line}")?;
     Ok(())
 }
 
 fn stats() -> Result<()> {
-    let Ok(text) = std::fs::read_to_string(log_path()?) else {
-        println!("no queries logged yet");
-        return Ok(());
-    };
-    let (mut n, mut ms, mut hits, mut returned, mut files) = (0u64, 0u64, 0u64, 0u64, 0u64);
-    let mut lat = vec![];
+    let text = std::fs::read_to_string(log_path()?).unwrap_or_default();
+    // tool -> (count, latencies, returned bytes, baseline bytes)
+    let mut by_tool: std::collections::BTreeMap<String, (u64, Vec<u64>, u64, u64)> = Default::default();
     for l in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(l) else { continue };
-        n += 1;
-        let m = v["ms"].as_u64().unwrap_or(0);
-        ms += m;
-        lat.push(m);
-        hits += v["hits"].as_u64().unwrap_or(0);
-        returned += v["returned_bytes"].as_u64().unwrap_or(0);
-        files += v["file_bytes"].as_u64().unwrap_or(0);
+        let e = by_tool.entry(v["tool"].as_str().unwrap_or("?").to_string()).or_default();
+        e.0 += 1;
+        e.1.push(v["ms"].as_u64().unwrap_or(0));
+        e.2 += v["returned_bytes"].as_u64().unwrap_or(0);
+        e.3 += v["file_bytes"].as_u64().unwrap_or(0);
     }
-    if n == 0 {
-        println!("no queries logged yet");
+    if by_tool.is_empty() {
+        println!("nothing logged yet");
         return Ok(());
     }
-    lat.sort_unstable();
-    let p = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
-    println!("queries        {n}");
-    println!("latency        p50 {} ms, p95 {} ms, total {:.1} s", p(0.5), p(0.95), ms as f64 / 1000.0);
-    println!("hit files      {hits}");
-    println!("returned       {} KB  (~{} tokens)", returned / 1024, returned / 4);
-    println!("whole files    {} KB  (~{} tokens)  what reading every hit file would cost", files / 1024, files / 4);
-    if files > returned {
-        println!("upper bound saved ~{} tokens ({:.1}x less than reading every hit file)", (files - returned) / 4, files as f64 / returned.max(1) as f64);
+    for (tool, (n, mut lat, returned, base)) in by_tool {
+        lat.sort_unstable();
+        let p = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
+        let baseline = if tool == "run" { "raw output" } else { "whole hit files" };
+        println!("{tool:<7} {n:>5} calls  p50 {:>5} ms  p95 {:>6} ms   ~{:>8} tokens returned vs ~{:>9} {baseline}  ({:.1}x)",
+            p(0.5), p(0.95), returned / 4, base / 4, base as f64 / returned.max(1) as f64);
     }
-    println!("\nestimate: tokens ≈ bytes / 4; 'whole files' assumes a grep-then-read agent opens every file a hit came from, so it is an upper bound");
+    println!("\nestimates: tokens ≈ bytes / 4. search/def baseline assumes an agent opens every file a hit came from;");
+    println!("run baseline is the full output, which a harness may already truncate. Both are upper bounds.");
     Ok(())
 }
 
@@ -463,6 +590,34 @@ mod tests {
         let mut names: Vec<_> = s.iter().map(|s| (s.name.as_str(), s.line)).collect();
         names.sort_by_key(|n| n.1);
         assert_eq!(names, vec![("Foo", 1), ("bar", 2), ("baz", 4), ("qux", 6)]);
+    }
+
+    #[test]
+    fn condense_keeps_errors_and_summary() {
+        let mut log: Vec<String> = (0..300).map(|i| format!("\x1b[32m✓\x1b[0m passing test number {i}")).collect();
+        log[100] = "src/app.ts(12,5): error TS2322: Type 'string' is not assignable to type 'number'.".into();
+        log[150] = "    at run (node_modules/vitest/dist/index.js:40:3)".into();
+        log[200] = "src/app.ts(12,5): error TS2322: Type 'string' is not assignable to type 'number'.".into();
+        log[250] = "AssertionError: expected 1 to equal 2".into();
+        log[258] = "+   \"id\": 1,".into(); // past the context window, kept because it is a diff line
+        log.push("Tests  1 failed | 299 passed".into());
+        let text = log.join("\n");
+
+        let (out, _, total) = condense(&text, false);
+        assert_eq!(total, 301);
+        assert_eq!(out.matches("TS2322").count(), 1, "repeated error shown once");
+        assert!(out.contains("\"id\": 1"), "diff line kept");
+        assert!(!out.contains("node_modules"), "dependency frames dropped");
+        assert!(out.contains("Tests  1 failed"), "summary kept");
+        assert!(!out.contains('\x1b'), "ansi stripped");
+        assert!(out.lines().count() < 25, "most of the 301 lines dropped:\n{out}");
+
+        let (ok_out, kept, _) = condense(&text, true);
+        assert!(kept <= TAIL, "success shows at most the tail");
+        assert!(ok_out.contains("Tests  1 failed"));
+
+        assert_eq!(condense("a\nb", false).0, "a\nb", "short output untouched");
+        assert_eq!(clean_line("10%\r50%\r100% done"), "100% done");
     }
 
     #[test]

@@ -28,9 +28,28 @@ Hook it into Claude Code or Cursor by adding to `.mcp.json`:
 
 Tools exposed: `search`, `def`, `reindex`.
 
+## Condensed command output
+
+```sh
+archive run -- yarn test
+archive run -- npx tsc --noEmit
+```
+
+Runs the command with stdout and stderr merged, saves the full output to `~/.cache/archive/runs/`, and prints only:
+
+- error, failure, panic and assertion lines with a little context, plus expected/received diff lines
+- lines pointing at your source (`file.ts:12`, `file.ts(12,5)`); frames inside `node_modules` and the runtime are dropped
+- the last 12 lines, where runners print their summary
+
+Passing-test lines, colour codes, progress-bar redraws and repeated lines are removed. Output under 60 lines is shown as-is, and a successful run shows only its tail. The exit code is the command's, so `&&` chains still work. The last line points at the full log in case the agent needs more.
+
+On a vitest run in a real monorepo (9 failing suites, 1 failing assertion) this kept 68 of 213 lines, 5.7 KB of 15.3 KB, including the full expected/received diff.
+
+`run` is CLI-only on purpose. As an MCP tool it would let an agent run arbitrary commands without your harness's permission prompts.
+
 ## Stats
 
-Every query appends one line to `~/.cache/archive/log.jsonl`: tool, query, latency, bytes returned, and the size of the distinct files the hits came from. `archive stats` sums them:
+Every query and `run` appends one line to `~/.cache/archive/log.jsonl`: tool, query, latency, bytes returned, and the size of the distinct files the hits came from. `archive stats` sums them:
 
 ```
 queries        7
