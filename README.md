@@ -25,7 +25,24 @@ archive refs hasMatchingConsent              # path:line  in <enclosing fn>  <li
 
 Checked against grep on 100 random symbols in a 4k-file TypeScript monorepo: of 534 lines grep matched (after dropping obvious comment lines), refs missed 8. None were code uses: they were comments, GraphQL query strings, closing tags and a multi-line import. References roughly add 60% to the index (78 MB to 125 MB for 4k files).
 
-Hook it into Claude Code or Cursor by adding to `.mcp.json`:
+### pi
+
+```sh
+archive install pi
+```
+
+This writes `~/.pi/agent/extensions/archive.ts` and adds a short section to `~/.pi/agent/AGENTS.md` on when to use each tool. Reinstalling replaces both; delete them to uninstall. In any git repo, the extension:
+
+- registers the archive MCP server for the repo root, so every project gets `search`, `def`, `refs` and `why` without per-project config
+- updates the index in the background when a session starts, so the first query doesn't wait for a rebuild
+- rewrites test, build, lint and typecheck commands (`yarn test`, `npx vitest run`, `tsc`, `eslint`, `cargo test`, `go test`, `pytest`, …) to `archive run -- …`. Each `&&` step is wrapped separately. Commands with pipes, redirects, `;` or watch/dev flags are left alone, and `ARCHIVE_RAW=1` opts out
+- after a grep for something shaped like a symbol (`useOrganizations`, `has_consent`), adds one line pointing at `def` and `refs`, at most three times a session
+
+The extension calls the binary it was installed from, so rerun `archive install pi` if you move it.
+
+### Claude Code, Cursor
+
+Add to `.mcp.json`:
 
 ```json
 { "mcpServers": { "archive": { "command": "archive", "args": ["mcp", "--dir", "."] } } }

@@ -31,7 +31,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// (Re)index a folder. Respects .gitignore.
-    Index { dir: PathBuf },
+    Index {
+        dir: PathBuf,
+        /// Only reindex changed files, as every query does first. Used to warm the index at session start.
+        #[arg(long)]
+        update: bool,
+    },
+    /// Install the pi extension: archive MCP tools, condensed test/build output, grep hints, index warm-up.
+    Install {
+        #[arg(value_parser = ["pi"])]
+        agent: String,
+    },
     /// Ranked passages (BM25) with file:line ranges.
     Search {
         query: String,
@@ -87,10 +97,12 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Index { dir } => {
+        Cmd::Index { dir, update: true } => drop(open(&dir)?),
+        Cmd::Index { dir, .. } => {
             let n = index(&dir)?;
             eprintln!("indexed {n} files");
         }
+        Cmd::Install { .. } => install_pi()?,
         Cmd::Search { query, limit, dir } => {
             let t = Instant::now();
             let hits = search(&open(&dir)?, &query, limit)?;
@@ -479,6 +491,8 @@ fn open(dir: &Path) -> Result<Connection> {
     let p = db_path(dir)?;
     let built = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
     let mut db = Connection::open(&p)?;
+    // a session's warm-up and its first query can both update at once; wait rather than fail
+    db.busy_timeout(std::time::Duration::from_secs(30))?;
     let has_files: bool = db.query_row("SELECT count(*) FROM sqlite_master WHERE name = 'files'", [], |r| r.get(0))?;
     let full = match built {
         Some(built) if has_files => {
@@ -617,8 +631,10 @@ fn walk(root: &Path) -> impl Iterator<Item = ignore::DirEntry> {
 fn index(dir: &Path) -> Result<usize> {
     let root = dir.canonicalize()?;
     let p = db_path(&root)?;
-    let _ = std::fs::remove_file(&p);
-    let mut db = Connection::open(&p)?;
+    // Build beside the old index and swap it in, so queries running meanwhile still see a whole one.
+    let tmp = p.with_extension(format!("{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut db = Connection::open(&tmp)?;
     db.execute_batch(
         "CREATE VIRTUAL TABLE chunks USING fts5(path UNINDEXED, start UNINDEXED, end UNINDEXED, body, words, tokenize='unicode61');
          CREATE TABLE symbols(name TEXT, kind TEXT, path TEXT, line INTEGER, signature TEXT);
@@ -665,7 +681,44 @@ fn index(dir: &Path) -> Result<usize> {
          CREATE INDEX symbols_path ON symbols(path);",
     )?;
     tx.commit()?;
+    drop(db);
+    if std::fs::rename(&tmp, &p).is_err() {
+        // Windows won't replace a file another process has open; that process only reads it briefly
+        let _ = std::fs::remove_file(&p);
+        std::fs::rename(&tmp, &p)?;
+    }
     Ok(n)
+}
+
+// ---------- install ----------
+
+const PI_EXTENSION: &str = include_str!("../integrations/pi/archive.ts");
+const AGENTS_NOTE: &str = include_str!("../integrations/AGENTS-snippet.md");
+
+fn install_pi() -> Result<()> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?);
+    let agent = std::env::var_os("PI_CODING_AGENT_DIR").map_or_else(|| home.join(".pi/agent"), PathBuf::from);
+    // The extension calls this exact binary, so it works even when archive is not on PATH.
+    let bin = std::env::current_exe()?.canonicalize()?;
+    let ext = agent.join("extensions/archive.ts");
+    std::fs::create_dir_all(ext.parent().unwrap())?;
+    std::fs::write(&ext, PI_EXTENSION.replace("__ARCHIVE_BIN__", &bin.to_string_lossy().replace('\\', "\\\\")))?;
+    println!("wrote {}", ext.display());
+
+    let agents_md = agent.join("AGENTS.md");
+    let current = std::fs::read_to_string(&agents_md).unwrap_or_default();
+    let start = "<!-- archive -->";
+    let block = format!("{start}\n{}<!-- /archive -->\n", AGENTS_NOTE);
+    // Replace our block on reinstall instead of appending a second copy.
+    let updated = match (current.find(start), current.find("<!-- /archive -->\n")) {
+        (Some(a), Some(b)) if b > a => format!("{}{block}{}", &current[..a], &current[b + "<!-- /archive -->\n".len()..]),
+        _ if current.is_empty() => block,
+        _ => format!("{}\n\n{block}", current.trim_end()),
+    };
+    std::fs::write(&agents_md, updated)?;
+    println!("updated {}", agents_md.display());
+    println!("restart pi or run /reload. Remove both to uninstall.");
+    Ok(())
 }
 
 struct FileRows {
