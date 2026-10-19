@@ -31,7 +31,21 @@ Hook it into Claude Code or Cursor by adding to `.mcp.json`:
 { "mcpServers": { "archive": { "command": "archive", "args": ["mcp", "--dir", "."] } } }
 ```
 
-Tools exposed: `search`, `def`, `refs`, `reindex`.
+Tools exposed: `search`, `def`, `refs`, `why`, `reindex`.
+
+### History
+
+```
+$ archive why apps/forumspace/src/features/consent/guard.ts:40-55
+717f21886 2026-09-28 Martin Moro  lines 54-55
+  [[sc-22184]] fix(forumspace): forward existing KAs from the consent page ...
+  PR #1505: 2026/09/29 - Frontend Release Doc
+8ac63c669 2026-08-03 Martin Moro  lines 40-41, 44-53
+  feat(forumspace): Step 1.5 matching-consent gate with route enforcement and seeded toggle
+  PR #1258: [[sc-21477]] KA Accounts — edit a profile item in place, ...
+```
+
+`why` runs `git blame` on a file or line range and groups the lines by commit, newest first, with up to six lines of each commit message's body. The PR is read from the subject for squash merges (`(#123)`), or else from the oldest GitHub `Merge pull request` commit leading to `HEAD` or `origin/HEAD`, whose body holds the PR title. That works for repos that commit straight to a staging branch too. Everything comes from local git, so no network and no token; GitLab-style merges are not recognised. About 50 ms per call.
 
 ### GraphQL schemas
 

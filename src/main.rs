@@ -51,7 +51,14 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
-    /// Run as an MCP server over stdio (tools: search, def, refs, reindex).
+    /// Why these lines are the way they are: the commits that last touched them, with message and PR.
+    /// Takes path, path:line or path:start-end.
+    Why {
+        target: String,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Run as an MCP server over stdio (tools: search, def, refs, why, reindex).
     Mcp {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
@@ -93,6 +100,12 @@ fn main() -> Result<()> {
             let (uses, total) = find_refs(&open(&dir)?, &name, limit)?;
             log(&dir, "refs", &name, t, uses.iter().map(|u| (u.path.as_str(), u.text.len())))?;
             println!("{}", format_refs(&uses, total));
+        }
+        Cmd::Why { target, dir } => {
+            let t = Instant::now();
+            let out = why(&dir, &target)?;
+            log(&dir, "why", &target, t, std::iter::once((target.split(':').next().unwrap_or(""), out.len())))?;
+            println!("{out}");
         }
         Cmd::Mcp { dir } => mcp(&dir)?,
         Cmd::Stats => stats()?,
@@ -223,6 +236,146 @@ fn interesting(l: &str) -> bool {
             (rest.starts_with(':') || rest.starts_with('(')) && rest[1..].starts_with(|c: char| c.is_ascii_digit())
         })
     })
+}
+
+// ---------- why: git history for a line range ----------
+
+fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().context("could not run git")?;
+    if !out.status.success() {
+        return Err(anyhow!("git {}: {}", args[0], String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `path`, `path:12` or `path:12-30` -> (path, Some((start, end)))
+fn parse_target(t: &str) -> Result<(&str, Option<(usize, usize)>)> {
+    let Some((path, range)) = t.rsplit_once(':').filter(|(_, r)| r.starts_with(|c: char| c.is_ascii_digit())) else {
+        return Ok((t, None));
+    };
+    let (a, b) = range.split_once('-').unwrap_or((range, range));
+    let (a, b): (usize, usize) = (a.parse()?, b.parse()?);
+    if a == 0 || b < a {
+        return Err(anyhow!("bad line range {range}"));
+    }
+    Ok((path, Some((a, b))))
+}
+
+struct Blame {
+    sha: String,
+    lines: Vec<usize>,
+    author: String,
+    time: i64,
+    summary: String,
+}
+
+fn parse_blame(porcelain: &str) -> Vec<Blame> {
+    let mut out: Vec<Blame> = vec![];
+    let mut cur: Option<usize> = None;
+    for l in porcelain.lines() {
+        if l.starts_with('\t') {
+            continue;
+        }
+        let mut f = l.split(' ');
+        let first = f.next().unwrap_or("");
+        if first.len() == 40 && first.chars().all(|c| c.is_ascii_hexdigit()) {
+            let line: usize = f.nth(1).and_then(|n| n.parse().ok()).unwrap_or(0);
+            let i = out.iter().position(|b| b.sha == first).unwrap_or_else(|| {
+                out.push(Blame { sha: first.into(), lines: vec![], author: String::new(), time: 0, summary: String::new() });
+                out.len() - 1
+            });
+            out[i].lines.push(line);
+            cur = Some(i);
+        } else if let Some(i) = cur {
+            let rest = l.split_once(' ').map_or("", |x| x.1);
+            match first {
+                "author" => out[i].author = rest.into(),
+                "author-time" => out[i].time = rest.parse().unwrap_or(0),
+                "summary" => out[i].summary = rest.into(),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// 3,4,5,9 -> "3-5, 9"
+fn line_ranges(lines: &[usize]) -> String {
+    let mut v = lines.to_vec();
+    v.sort_unstable();
+    let mut parts: Vec<String> = vec![];
+    let mut i = 0;
+    while i < v.len() {
+        let mut j = i;
+        while j + 1 < v.len() && v[j + 1] == v[j] + 1 {
+            j += 1;
+        }
+        parts.push(if i == j { v[i].to_string() } else { format!("{}-{}", v[i], v[j]) });
+        i = j + 1;
+    }
+    parts.join(", ")
+}
+
+/// The PR a commit arrived in. Squash merges carry `(#123)` in the subject; otherwise it is the
+/// oldest merge commit leading to HEAD or the remote default branch (repos that commit straight to
+/// a staging branch only get a PR when it merges into main). GitHub puts the PR title in its body.
+fn pr_for(dir: &Path, sha: &str, summary: &str) -> Option<String> {
+    if summary.contains("(#") {
+        return None; // already in the subject
+    }
+    let not = format!("^{sha}");
+    let mut args = vec!["log", "--merges", "--ancestry-path", "--reverse", "--format=%s%x1f%b%x1e", &not, "HEAD"];
+    if git(dir, &["rev-parse", "--verify", "-q", "origin/HEAD"]).is_ok() {
+        args.push("origin/HEAD");
+    }
+    let merges = git(dir, &args).ok()?;
+    // skip local merges like "Merge branch 'main' into staging"; only GitHub's PR merges name a PR
+    let (subject, body, num) = merges.split('\x1e').find_map(|m| {
+        let (s, b) = m.trim().split_once('\x1f')?;
+        let num = s.strip_prefix("Merge pull request ")?.split_whitespace().next()?;
+        Some((s, b, num))
+    })?;
+    let title = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(subject);
+    Some(format!("PR {num}: {title}"))
+}
+
+fn why(dir: &Path, target: &str) -> Result<String> {
+    let (path, range) = parse_target(target)?;
+    let mut args = vec!["blame", "--porcelain", "-w"];
+    let r;
+    if let Some((a, b)) = range {
+        r = format!("{a},{b}");
+        args.extend(["-L", &r]);
+    }
+    args.extend(["--", path]);
+    let mut blames = parse_blame(&git(dir, &args)?);
+    blames.sort_by_key(|b| -b.time); // newest first: the most recent change is usually the question
+    let shown = blames.len().min(8);
+    let mut out = vec![];
+    for b in &blames[..shown] {
+        let lines = line_ranges(&b.lines);
+        if b.sha.bytes().all(|c| c == b'0') {
+            out.push(format!("uncommitted  lines {lines}"));
+            continue;
+        }
+        let date = git(dir, &["show", "-s", "--format=%as", &b.sha]).unwrap_or_default();
+        out.push(format!("{} {} {}  lines {lines}\n  {}", &b.sha[..9], date.trim(), b.author, b.summary));
+        let body = git(dir, &["show", "-s", "--format=%b", &b.sha]).unwrap_or_default();
+        let body: Vec<&str> = body.lines().map(str::trim_end).filter(|l| !l.trim().is_empty() && !l.to_lowercase().starts_with("co-authored-by")).collect();
+        for l in body.iter().take(6) {
+            out.push(format!("  | {l}"));
+        }
+        if body.len() > 6 {
+            out.push(format!("  | … git show {}", &b.sha[..9]));
+        }
+        if let Some(pr) = pr_for(dir, &b.sha, &b.summary) {
+            out.push(format!("  {pr}"));
+        }
+    }
+    if blames.len() > shown {
+        out.push(format!("… {} older commits; narrow the line range", blames.len() - shown));
+    }
+    Ok(out.join("\n"))
 }
 
 // ---------- usage log ----------
@@ -813,6 +966,8 @@ fn mcp(dir: &Path) -> Result<()> {
          "inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
         {"name":"refs","description":"Where a TS/JS/GDScript symbol is used: calls, new, JSX components, type references. Returns path:line, the enclosing function, and the line. Exact name. Use before renaming or changing a signature.",
          "inputSchema":{"type":"object","properties":{"name":{"type":"string"},"limit":{"type":"integer","default":50}},"required":["name"]}},
+        {"name":"why","description":"Git history for a file or line range: the commits that last changed those lines, newest first, with message body and the PR they were merged in. target is path, path:line or path:start-end. Use before changing code whose intent is unclear.",
+         "inputSchema":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}},
         {"name":"reindex","description":"Rebuild the index after large edits.","inputSchema":{"type":"object","properties":{}}}
     ]);
     for line in stdin.lock().lines() {
@@ -878,6 +1033,13 @@ fn call(dir: &Path, params: &Value) -> Result<String> {
             let (uses, total) = find_refs(&open(dir)?, name, limit)?;
             log(dir, "refs", name, t, uses.iter().map(|u| (u.path.as_str(), u.text.len())))?;
             Ok(format_refs(&uses, total))
+        }
+        "why" => {
+            let target = args["target"].as_str().ok_or_else(|| anyhow!("target required"))?;
+            let t = Instant::now();
+            let out = why(dir, target)?;
+            log(dir, "why", target, t, std::iter::once((target.split(':').next().unwrap_or(""), out.len())))?;
+            Ok(out)
         }
         "reindex" => Ok(format!("indexed {} files", index(dir)?)),
         other => Err(anyhow!("unknown tool {other}")),
@@ -957,6 +1119,22 @@ mod tests {
         assert_eq!(s[2].signature, "personUpdatePassword(input: PersonUpdatePasswordInput!): Payload");
         let s = graphql_symbols("schema {\n  query: RootQueryType\n}\ntype RootQueryType {\n  me: Person\n}\n");
         assert!(s.iter().any(|s| s.name == "me" && s.kind == "graphql query"), "renamed root type");
+    }
+
+    #[test]
+    fn why_helpers() {
+        assert_eq!(parse_target("src/a.ts").unwrap(), ("src/a.ts", None));
+        assert_eq!(parse_target("src/a.ts:12").unwrap(), ("src/a.ts", Some((12, 12))));
+        assert_eq!(parse_target("C:/x.ts:3-9").unwrap(), ("C:/x.ts", Some((3, 9))));
+        assert!(parse_target("a.ts:9-3").is_err());
+        assert_eq!(line_ranges(&[9, 3, 4, 5, 11, 12]), "3-5, 9, 11-12");
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let p = format!("{a} 1 10 2\nauthor Ann\nauthor-time 100\nsummary fix x\n\tline\n{a} 2 11\n\tline\n{b} 5 12 1\nauthor Bob\nauthor-time 200\nsummary add y\n\tline\n");
+        let bl = parse_blame(&p);
+        assert_eq!(bl.len(), 2);
+        assert_eq!((bl[0].lines.clone(), bl[0].author.as_str(), bl[0].summary.as_str()), (vec![10, 11], "Ann", "fix x"));
+        assert_eq!((bl[1].lines.clone(), bl[1].time), (vec![12], 200));
     }
 
     #[test]
