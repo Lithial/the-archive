@@ -43,7 +43,15 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
-    /// Run as an MCP server over stdio (tools: search, def, reindex).
+    /// Where a symbol is used: calls, `new`, JSX, type references, with the enclosing function. Exact name.
+    Refs {
+        name: String,
+        #[arg(short, long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Run as an MCP server over stdio (tools: search, def, refs, reindex).
     Mcp {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
@@ -79,6 +87,12 @@ fn main() -> Result<()> {
             for d in defs {
                 println!("{}:{}  [{}] {}", d.path, d.line, d.kind, d.signature);
             }
+        }
+        Cmd::Refs { name, limit, dir } => {
+            let t = Instant::now();
+            let (uses, total) = find_refs(&open(&dir)?, &name, limit)?;
+            log(&dir, "refs", &name, t, uses.iter().map(|u| (u.path.as_str(), u.text.len())))?;
+            println!("{}", format_refs(&uses, total));
         }
         Cmd::Mcp { dir } => mcp(&dir)?,
         Cmd::Stats => stats()?,
@@ -324,7 +338,9 @@ fn index(dir: &Path) -> Result<usize> {
     db.execute_batch(
         "CREATE VIRTUAL TABLE chunks USING fts5(path UNINDEXED, start UNINDEXED, end UNINDEXED, body, words, tokenize='unicode61');
          CREATE TABLE symbols(name TEXT, kind TEXT, path TEXT, line INTEGER, signature TEXT);
-         CREATE INDEX symbols_name ON symbols(name);",
+         CREATE INDEX symbols_name ON symbols(name);
+         CREATE TABLE refs(name TEXT, path TEXT, line INTEGER, caller TEXT, text TEXT, plain INTEGER);",
+         // refs_name index is built after the inserts; that is faster than maintaining it per row
     )?;
     let tx = db.transaction()?;
     let mut n = 0;
@@ -356,15 +372,22 @@ fn index(dir: &Path) -> Result<usize> {
             start += STEP;
         }
         if let Some(lang) = ts_language(entry.path()) {
-            for s in symbols(&text, lang) {
+            for s in symbols(&text, lang.clone()) {
                 tx.execute(
                     "INSERT INTO symbols VALUES(?1,?2,?3,?4,?5)",
                     params![s.name, s.kind, rel, s.line, s.signature],
                 )?;
             }
+            for r in refs(&text, lang) {
+                tx.execute("INSERT INTO refs VALUES(?1,?2,?3,?4,?5,?6)", params![r.name, rel, r.line, r.caller, r.text, r.plain])?;
+            }
         }
         n += 1;
     }
+    tx.execute_batch(
+        "DELETE FROM refs WHERE plain AND name NOT IN (SELECT name FROM symbols);
+         CREATE INDEX refs_name ON refs(name);",
+    )?;
     tx.commit()?;
     Ok(n)
 }
@@ -436,6 +459,44 @@ fn def(db: &Connection, name: &str) -> Result<Vec<Def>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+struct Use {
+    path: String,
+    line: i64,
+    caller: String,
+    text: String,
+}
+
+/// Exact name only: substring matches on "get" would return half the repo.
+fn find_refs(db: &Connection, name: &str, limit: usize) -> Result<(Vec<Use>, usize)> {
+    let total: usize = db.query_row("SELECT count(*) FROM refs WHERE name = ?1", [name], |r| r.get(0))?;
+    let mut stmt = db.prepare(
+        // implementation before tests, same order as search
+        "SELECT path, line, caller, text FROM refs WHERE name = ?1
+         ORDER BY (path GLOB '*.test.*' OR path GLOB '*.spec.*' OR path GLOB '*__tests__*' OR path GLOB '*.stories.*'), path, line LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![name, limit as i64], |r| {
+        Ok(Use { path: r.get(0)?, line: r.get(1)?, caller: r.get(2)?, text: r.get(3)? })
+    })?;
+    Ok((rows.collect::<Result<_, _>>()?, total))
+}
+
+fn format_refs(uses: &[Use], total: usize) -> String {
+    if uses.is_empty() {
+        return "no references found".into();
+    }
+    let mut out: Vec<String> = uses
+        .iter()
+        .map(|u| {
+            let caller = if u.caller.is_empty() { "top level".to_string() } else { u.caller.clone() };
+            format!("{}:{}  in {}  {}", u.path, u.line, caller, u.text)
+        })
+        .collect();
+    if total > uses.len() {
+        out.push(format!("… {} more, raise --limit to see them", total - uses.len()));
+    }
+    out.join("\n")
+}
+
 // ---------- symbols (tree-sitter, TS/JS) ----------
 
 struct Sym {
@@ -464,39 +525,116 @@ fn symbols(src: &str, lang: tree_sitter::Language) -> Vec<Sym> {
     let mut cursor = tree.walk();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        let kind = node.kind();
-        let named = matches!(
-            kind,
-            "function_declaration" | "class_declaration" | "abstract_class_declaration" | "method_definition"
-                | "interface_declaration" | "type_alias_declaration" | "enum_declaration" | "variable_declarator"
-                // GDScript
-                | "class_name_statement" | "class_definition" | "function_definition" | "signal_statement" | "enum_definition"
-                | "variable_statement" | "const_statement"
-        );
-        if named {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let is_fn_var = kind != "variable_declarator"
-                    || node.child_by_field_name("value").map_or(false, |v| {
-                        matches!(v.kind(), "arrow_function" | "function_expression" | "function")
-                    });
-                if is_fn_var {
-                    let text = &src[node.byte_range()];
-                    out.push(Sym {
-                        name: src[name_node.byte_range()].to_string(),
-                        kind: ["_declaration", "_declarator", "_definition", "_statement"]
-                            .iter()
-                            .fold(kind, |k, s| k.trim_end_matches(s))
-                            .replace('_', " "),
-                        line: node.start_position().row + 1,
-                        signature: text.lines().next().unwrap_or("").trim().chars().take(160).collect(),
-                    });
-                }
-            }
+        if let Some(name_node) = def_name(node) {
+            let text = &src[node.byte_range()];
+            out.push(Sym {
+                name: src[name_node.byte_range()].to_string(),
+                kind: ["_declaration", "_declarator", "_definition", "_statement"]
+                    .iter()
+                    .fold(node.kind(), |k, s| k.trim_end_matches(s))
+                    .replace('_', " "),
+                line: node.start_position().row + 1,
+                signature: text.lines().next().unwrap_or("").trim().chars().take(160).collect(),
+            });
         }
         for child in node.children(&mut cursor) {
             stack.push(child);
         }
     }
+    out
+}
+
+/// The name node if `node` defines a symbol. Plain variables only count when they hold a function.
+fn def_name(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let kind = node.kind();
+    let named = matches!(
+        kind,
+        "function_declaration" | "class_declaration" | "abstract_class_declaration" | "method_definition"
+            | "interface_declaration" | "type_alias_declaration" | "enum_declaration" | "variable_declarator"
+            // GDScript
+            | "class_name_statement" | "class_definition" | "function_definition" | "signal_statement" | "enum_definition"
+            | "variable_statement" | "const_statement"
+    );
+    if !named {
+        return None;
+    }
+    let is_fn_var = kind != "variable_declarator"
+        || node.child_by_field_name("value").map_or(false, |v| matches!(v.kind(), "arrow_function" | "function_expression" | "function"));
+    is_fn_var.then(|| node.child_by_field_name("name")).flatten()
+}
+
+struct Ref {
+    name: String,
+    /// a bare mention (`onClick={save}`), not a call or type use; kept only for names defined in the repo
+    plain: bool,
+    line: usize,
+    caller: String,
+    text: String,
+}
+
+/// Uses of a name: calls, `new`, JSX components, type references. `caller` is the enclosing
+/// function or class, which is the part an agent wants before a refactor.
+fn refs(src: &str, lang: tree_sitter::Language) -> Vec<Ref> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&lang).is_err() {
+        return vec![];
+    }
+    let Some(tree) = parser.parse(src, None) else { return vec![] };
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = vec![];
+    let mut stack = vec![(tree.root_node(), String::new())];
+    while let Some((node, caller)) = stack.pop() {
+        let text = |n: tree_sitter::Node| src[n.byte_range()].to_string();
+        // For a.b.c() the name is c.
+        let last = |n: tree_sitter::Node| match n.kind() {
+            "identifier" | "type_identifier" => Some(text(n)),
+            "member_expression" | "nested_identifier" => n.child_by_field_name("property").map(text),
+            _ => None,
+        };
+        // imports and `</Foo>` restate a use that is already counted
+        let parent_import = || node.parent().map_or(false, |p| p.kind().starts_with("import") || p.kind() == "jsx_closing_element");
+        // Property names count (object keys, `mock.fn = ...`, `fn: () => void` in props): a rename breaks
+        // `vi.mock(..., () => ({ save: fn }))` without an error.
+        let plain = matches!(
+            node.kind(),
+            "identifier" | "property_identifier" | "shorthand_property_identifier" | "shorthand_property_identifier_pattern"
+        )
+            && node.parent().and_then(def_name) != Some(node)
+            && !parent_import();
+        let name = match node.kind() {
+            _ if plain => Some(text(node)),
+            "call_expression" => node.child_by_field_name("function").and_then(last),
+            "new_expression" => node.child_by_field_name("constructor").and_then(last),
+            // lowercase JSX names are HTML tags
+            "jsx_opening_element" | "jsx_self_closing_element" => {
+                node.child_by_field_name("name").and_then(last).filter(|n| n.starts_with(char::is_uppercase))
+            }
+            // skip the name in `interface Foo`, which def already covers
+            "type_identifier" if node.parent().and_then(def_name) != Some(node) => Some(text(node)),
+            // GDScript: foo(), obj.foo(), super.foo()
+            "call" | "attribute_call" | "base_call" => node.named_child(0).filter(|n| n.kind() == "identifier").map(text),
+            _ => None,
+        };
+        if let Some(name) = name {
+            let row = node.start_position().row;
+            out.push(Ref {
+                name,
+                plain,
+                line: row + 1,
+                caller: caller.clone(),
+                text: lines.get(row).unwrap_or(&"").trim().chars().take(160).collect(),
+            });
+        }
+        let inner = def_name(node).map_or(caller, text);
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push((child, inner.clone()));
+        }
+    }
+    // plain sorts last so a call on the same line wins the dedup
+    out.sort_by(|a, b| (a.line, &a.name, a.plain).cmp(&(b.line, &b.name, b.plain)));
+    // one row per name per line; `foo(foo())` is still one place to change
+    out.dedup_by(|a, b| a.line == b.line && a.name == b.name);
     out
 }
 
@@ -510,6 +648,8 @@ fn mcp(dir: &Path) -> Result<()> {
          "inputSchema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","default":8}},"required":["query"]}},
         {"name":"def","description":"Go to definition of a TS/JS symbol: path:line, kind, signature. Substring match.",
          "inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
+        {"name":"refs","description":"Where a TS/JS/GDScript symbol is used: calls, new, JSX components, type references. Returns path:line, the enclosing function, and the line. Exact name. Use before renaming or changing a signature.",
+         "inputSchema":{"type":"object","properties":{"name":{"type":"string"},"limit":{"type":"integer","default":50}},"required":["name"]}},
         {"name":"reindex","description":"Rebuild the index after large edits.","inputSchema":{"type":"object","properties":{}}}
     ]);
     for line in stdin.lock().lines() {
@@ -568,6 +708,14 @@ fn call(dir: &Path, params: &Value) -> Result<String> {
             }
             Ok(defs.iter().map(|d| format!("{}:{}  [{}] {}", d.path, d.line, d.kind, d.signature)).collect::<Vec<_>>().join("\n"))
         }
+        "refs" => {
+            let name = args["name"].as_str().ok_or_else(|| anyhow!("name required"))?;
+            let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+            let t = Instant::now();
+            let (uses, total) = find_refs(&open(dir)?, name, limit)?;
+            log(dir, "refs", name, t, uses.iter().map(|u| (u.path.as_str(), u.text.len())))?;
+            Ok(format_refs(&uses, total))
+        }
         "reindex" => Ok(format!("indexed {} files", index(dir)?)),
         other => Err(anyhow!("unknown tool {other}")),
     }
@@ -590,6 +738,41 @@ mod tests {
         let mut names: Vec<_> = s.iter().map(|s| (s.name.as_str(), s.line)).collect();
         names.sort_by_key(|n| n.1);
         assert_eq!(names, vec![("Foo", 1), ("bar", 2), ("baz", 4), ("qux", 6)]);
+    }
+
+    #[test]
+    fn finds_ts_refs() {
+        let src = "import { load } from './x'\ninterface User { id: string }\nfunction load(u: User) {\n  return api.fetchUser(u.id)\n}\nconst Page = () => <Avatar user={load(x)} onClick={load}></Avatar>;\nnew Cache<User>();\nfetchUser(1);\n";
+        let r = refs(src, tree_sitter_typescript::LANGUAGE_TSX.into());
+        let plain: Vec<_> = r.iter().filter(|r| r.plain && r.name == "load").map(|r| r.line).collect();
+        assert_eq!(plain, vec![] as Vec<usize>, "import, definition and same-line call are not plain uses");
+        let r = refs(&src.replace("onClick={load}", "").replace("load(x)", "load"), tree_sitter_typescript::LANGUAGE_TSX.into());
+        assert!(r.iter().any(|r| r.plain && r.name == "load" && r.line == 6), "callback passed by name");
+        let r = refs(
+            "vi.mock('./a', () => ({ load: fn }));\nconst { load: l, save } = api;\nmock.load = fn;\ninterface P { load: () => void }\n",
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        );
+        let got: Vec<_> = r.iter().filter(|r| r.plain).map(|r| (r.name.as_str(), r.line)).collect();
+        for want in [("load", 1), ("load", 2), ("save", 2), ("load", 3), ("load", 4)] {
+            assert!(got.contains(&want), "{want:?} missing from {got:?}");
+        }
+        let r = refs(src, tree_sitter_typescript::LANGUAGE_TSX.into());
+        let got: Vec<_> = r.iter().filter(|r| !r.plain).map(|r| (r.name.as_str(), r.line - 1, r.caller.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("User", 2, "load"), ("fetchUser", 3, "load"), ("Avatar", 5, "Page"), ("load", 5, "Page"),
+                ("Cache", 6, ""), ("User", 6, ""), ("fetchUser", 7, ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_gdscript_refs() {
+        let src = "func _ready():\n\tspawn(1)\n\tself.hit()\n\tsuper.init()\n";
+        let r = refs(src, tree_sitter_gdscript::LANGUAGE.into());
+        let got: Vec<_> = r.iter().filter(|r| !r.plain).map(|r| (r.name.as_str(), r.line, r.caller.as_str())).collect();
+        assert_eq!(got, vec![("spawn", 2, "_ready"), ("hit", 3, "_ready"), ("init", 4, "_ready")]);
     }
 
     #[test]

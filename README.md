@@ -15,10 +15,15 @@ cargo install --git https://github.com/lithial/the-archive
 ## Use
 
 ```sh
-archive index .                              # ~3 s for 4k files; respects .gitignore
+archive index .                              # ~6 s for 4k files; respects .gitignore
 archive search "how does the websocket reconnect"
 archive def useOrganizations                 # path:line [kind] signature
+archive refs hasMatchingConsent              # path:line  in <enclosing fn>  <line>
 ```
+
+`refs` lists every place a name is used: calls, `new`, JSX components, type references, callbacks passed by name, destructuring, and object keys such as `vi.mock(..., () => ({ save: fn }))`, which a rename would otherwise break without an error. Each hit names the function or class it sits in. Implementation files come before tests. It matches the exact name, from the syntax tree rather than text, so comments and strings are skipped. It does not resolve scopes: two unrelated functions called `save` share one list.
+
+Checked against grep on 100 random symbols in a 4k-file TypeScript monorepo: of 534 lines grep matched (after dropping obvious comment lines), refs missed 8. None were code uses: they were comments, GraphQL query strings, closing tags and a multi-line import. References roughly add 60% to the index (78 MB to 125 MB for 4k files).
 
 Hook it into Claude Code or Cursor by adding to `.mcp.json`:
 
@@ -26,7 +31,7 @@ Hook it into Claude Code or Cursor by adding to `.mcp.json`:
 { "mcpServers": { "archive": { "command": "archive", "args": ["mcp", "--dir", "."] } } }
 ```
 
-Tools exposed: `search`, `def`, `reindex`.
+Tools exposed: `search`, `def`, `refs`, `reindex`.
 
 ## Condensed command output
 
