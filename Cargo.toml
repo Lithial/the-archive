@@ -1,10 +1,10 @@
 [package]
-name = "cq"
+name = "archive"
 version = "0.1.0"
 edition = "2021"
 description = "Local code search for coding agents: BM25 passages + go-to-definition, CLI and MCP. No network."
 license = "MIT"
-repository = "https://github.com/lithial/cq"
+repository = "https://github.com/lithial/the-archive"
 
 [dependencies]
 anyhow = "1"

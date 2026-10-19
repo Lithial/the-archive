@@ -1,5 +1,5 @@
-//! cq: local code search for coding agents. BM25 passages + go-to-definition.
-//! Index lives in ~/.cache/cq/. No network, no telemetry, nothing leaves the machine.
+//! archive: local code search for coding agents. BM25 passages + go-to-definition.
+//! Index lives in ~/.cache/archive/. No network, no telemetry, nothing leaves the machine.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -79,7 +79,7 @@ fn db_path(dir: &Path) -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .ok_or_else(|| anyhow!("HOME not set"))?
-        .join("cq");
+        .join("archive");
     std::fs::create_dir_all(&cache)?;
     Ok(cache.join(format!("{name}.db")))
 }
@@ -87,7 +87,7 @@ fn db_path(dir: &Path) -> Result<PathBuf> {
 fn open(dir: &Path) -> Result<Connection> {
     let p = db_path(dir)?;
     if !p.exists() {
-        return Err(anyhow!("no index for {}; run `cq index {}` first", dir.display(), dir.display()));
+        return Err(anyhow!("no index for {}; run `archive index {}` first", dir.display(), dir.display()));
     }
     Ok(Connection::open(p)?)
 }
@@ -291,7 +291,7 @@ fn mcp(dir: &Path) -> Result<()> {
         let id = req.get("id").cloned();
         let method = req["method"].as_str().unwrap_or("");
         let result = match method {
-            "initialize" => json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"cq","version":env!("CARGO_PKG_VERSION")}}),
+            "initialize" => json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"archive","version":env!("CARGO_PKG_VERSION")}}),
             "tools/list" => json!({"tools": tools}),
             "tools/call" => match call(dir, &req["params"]) {
                 Ok(text) => json!({"content":[{"type":"text","text":text}]}),

@@ -1,27 +1,27 @@
-# cq
+# The Archive
 
 Local code search for coding agents. BM25 passage search plus go-to-definition, as a CLI and an MCP server. One binary, one SQLite file, no network.
 
-The idea: an agent that greps reads whole files into its context. An agent with a ranked `search` and an exact `def` tool pulls the passage it needs. cq is the smallest thing that does that.
+The idea: an agent that greps reads whole files into its context. An agent with a ranked `search` and an exact `def` tool pulls the passage it needs. archive is the smallest thing that does that.
 
 ## Install
 
 ```sh
-cargo install --git https://github.com/lithial/cq
+cargo install --git https://github.com/lithial/the-archive
 ```
 
 ## Use
 
 ```sh
-cq index .                              # ~3 s for 4k files; respects .gitignore
-cq search "how does the websocket reconnect"
-cq def useOrganizations                 # path:line [kind] signature
+archive index .                              # ~3 s for 4k files; respects .gitignore
+archive search "how does the websocket reconnect"
+archive def useOrganizations                 # path:line [kind] signature
 ```
 
 Hook it into Claude Code or Cursor by adding to `.mcp.json`:
 
 ```json
-{ "mcpServers": { "cq": { "command": "cq", "args": ["mcp", "--dir", "."] } } }
+{ "mcpServers": { "archive": { "command": "archive", "args": ["mcp", "--dir", "."] } } }
 ```
 
 Tools exposed: `search`, `def`, `reindex`.
@@ -32,7 +32,7 @@ Tools exposed: `search`, `def`, `reindex`.
 - Identifiers and paths are split (`useRemovePerson.ts` → `use Remove Person`) so plain-English queries hit file and symbol names.
 - Test, story and fixture files rank at 0.8× so the implementation wins a tie.
 - `def` uses tree-sitter. TypeScript and JavaScript only for now; another language is a grammar crate and a few node names.
-- The index lives in `~/.cache/cq/<path>.db`. Reindex is a full rebuild.
+- The index lives in `~/.cache/archive/<path>.db`. Reindex is a full rebuild.
 
 ## What it doesn't do
 
