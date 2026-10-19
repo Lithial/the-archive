@@ -3,6 +3,8 @@ name = "cq"
 version = "0.1.0"
 edition = "2021"
 description = "Local code search for coding agents: BM25 passages + go-to-definition, CLI and MCP. No network."
+license = "MIT"
+repository = "https://github.com/lithial/cq"
 
 [dependencies]
 anyhow = "1"
