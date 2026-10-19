@@ -26,6 +26,20 @@ Hook it into Claude Code or Cursor by adding to `.mcp.json`:
 
 Tools exposed: `search`, `def`, `reindex`.
 
+## Stats
+
+Every query appends one line to `~/.cache/archive/log.jsonl`: tool, query, latency, bytes returned, and the size of the distinct files the hits came from. `archive stats` sums them:
+
+```
+queries        7
+latency        p50 36 ms, p95 36 ms, total 0.3 s
+returned       51 KB  (~13190 tokens)
+whole files    1327 KB  (~339887 tokens)  what reading every hit file would cost
+upper bound saved ~326697 tokens (25.8x less than reading every hit file)
+```
+
+The saving is an estimate and an upper bound: tokens are bytes/4, and it assumes a grep-then-read agent would have opened every file a hit came from. It is not measured against a real agent run. The log never leaves the machine; delete it whenever you like.
+
 ## How it works
 
 - Files are split into 40-line passages with 10 lines of overlap and stored in SQLite FTS5. Ranking is BM25.

@@ -7,6 +7,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const WINDOW: usize = 40; // lines per passage
 const STEP: usize = 30; // overlap of 10 lines so a hit at a boundary is not cut in half
@@ -47,6 +48,8 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
+    /// Usage totals from ~/.cache/archive/log.jsonl: queries, latency, bytes returned vs whole files.
+    Stats,
 }
 
 fn main() -> Result<()> {
@@ -56,17 +59,86 @@ fn main() -> Result<()> {
             eprintln!("indexed {n} files");
         }
         Cmd::Search { query, limit, dir } => {
-            for h in search(&open(&dir)?, &query, limit)? {
+            let t = Instant::now();
+            let hits = search(&open(&dir)?, &query, limit)?;
+            log(&dir, "search", &query, t, hits.iter().map(|h| (h.path.as_str(), h.body.len())))?;
+            for h in hits {
                 println!("{}:{}-{}  (score {:.1})\n{}\n", h.path, h.start, h.end, h.score, h.body);
             }
         }
         Cmd::Def { name, dir } => {
-            for d in def(&open(&dir)?, &name)? {
+            let t = Instant::now();
+            let defs = def(&open(&dir)?, &name)?;
+            log(&dir, "def", &name, t, defs.iter().map(|d| (d.path.as_str(), d.signature.len())))?;
+            for d in defs {
                 println!("{}:{}  [{}] {}", d.path, d.line, d.kind, d.signature);
             }
         }
         Cmd::Mcp { dir } => mcp(&dir)?,
+        Cmd::Stats => stats()?,
     }
+    Ok(())
+}
+
+// ---------- usage log ----------
+
+fn log_path() -> Result<PathBuf> {
+    Ok(db_path(Path::new("."))?.with_file_name("log.jsonl"))
+}
+
+/// One JSONL line per query. `file_bytes` is the size of the distinct files the hits came
+/// from: what an agent that grepped and then read those files would have pulled into context.
+fn log<'a>(dir: &Path, tool: &str, query: &str, start: Instant, hits: impl Iterator<Item = (&'a str, usize)>) -> Result<()> {
+    let root = dir.canonicalize()?;
+    let mut returned = 0u64;
+    let mut files = std::collections::BTreeSet::new();
+    for (path, len) in hits {
+        returned += len as u64;
+        files.insert(path.to_string());
+    }
+    let file_bytes: u64 = files.iter().filter_map(|p| std::fs::metadata(root.join(p)).ok()).map(|m| m.len()).sum();
+    let line = json!({
+        "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+        "dir": root, "tool": tool, "query": query, "ms": start.elapsed().as_millis() as u64,
+        "hits": files.len(), "returned_bytes": returned, "file_bytes": file_bytes,
+    });
+    let mut f = std::fs::OpenOptions::new().append(true).create(true).open(log_path()?)?;
+    writeln!(f, "{line}")?;
+    Ok(())
+}
+
+fn stats() -> Result<()> {
+    let Ok(text) = std::fs::read_to_string(log_path()?) else {
+        println!("no queries logged yet");
+        return Ok(());
+    };
+    let (mut n, mut ms, mut hits, mut returned, mut files) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut lat = vec![];
+    for l in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(l) else { continue };
+        n += 1;
+        let m = v["ms"].as_u64().unwrap_or(0);
+        ms += m;
+        lat.push(m);
+        hits += v["hits"].as_u64().unwrap_or(0);
+        returned += v["returned_bytes"].as_u64().unwrap_or(0);
+        files += v["file_bytes"].as_u64().unwrap_or(0);
+    }
+    if n == 0 {
+        println!("no queries logged yet");
+        return Ok(());
+    }
+    lat.sort_unstable();
+    let p = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
+    println!("queries        {n}");
+    println!("latency        p50 {} ms, p95 {} ms, total {:.1} s", p(0.5), p(0.95), ms as f64 / 1000.0);
+    println!("hit files      {hits}");
+    println!("returned       {} KB  (~{} tokens)", returned / 1024, returned / 4);
+    println!("whole files    {} KB  (~{} tokens)  what reading every hit file would cost", files / 1024, files / 4);
+    if files > returned {
+        println!("upper bound saved ~{} tokens ({:.1}x less than reading every hit file)", (files - returned) / 4, files as f64 / returned.max(1) as f64);
+    }
+    println!("\nestimate: tokens ≈ bytes / 4; 'whole files' assumes a grep-then-read agent opens every file a hit came from, so it is an upper bound");
     Ok(())
 }
 
@@ -334,7 +406,9 @@ fn call(dir: &Path, params: &Value) -> Result<String> {
         "search" => {
             let q = args["query"].as_str().ok_or_else(|| anyhow!("query required"))?;
             let limit = args["limit"].as_u64().unwrap_or(8) as usize;
+            let t = Instant::now();
             let hits = search(&open(dir)?, q, limit)?;
+            log(dir, "search", q, t, hits.iter().map(|h| (h.path.as_str(), h.body.len())))?;
             if hits.is_empty() {
                 return Ok("no matches".into());
             }
@@ -342,7 +416,9 @@ fn call(dir: &Path, params: &Value) -> Result<String> {
         }
         "def" => {
             let name = args["name"].as_str().ok_or_else(|| anyhow!("name required"))?;
+            let t = Instant::now();
             let defs = def(&open(dir)?, name)?;
+            log(dir, "def", name, t, defs.iter().map(|d| (d.path.as_str(), d.signature.len())))?;
             if defs.is_empty() {
                 return Ok("no definition found".into());
             }
