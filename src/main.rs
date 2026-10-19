@@ -166,7 +166,12 @@ fn open(dir: &Path) -> Result<Connection> {
     };
     let stale = match built {
         None => true,
-        Some(built) => walk(dir).any(|e| e.metadata().ok().and_then(|m| m.modified().ok()).map_or(true, |t| t > built)),
+        Some(built) => {
+            let newer = |m: std::fs::Metadata| m.modified().map_or(true, |t| t > built);
+            // .archiveignore is a hidden file, so the walk skips it; check it directly.
+            std::fs::metadata(dir.join(".archiveignore")).map_or(false, newer)
+                || walk(dir).any(|e| e.metadata().map_or(true, newer))
+        }
     };
     if stale {
         let n = index(dir)?;
@@ -175,8 +180,13 @@ fn open(dir: &Path) -> Result<Connection> {
     Ok(Connection::open(p)?)
 }
 
+/// Respects .gitignore plus `.archiveignore` (same syntax) for things you track but don't want searched, like vendor code.
 fn walk(root: &Path) -> impl Iterator<Item = ignore::DirEntry> {
-    ignore::WalkBuilder::new(root).hidden(true).build().filter_map(Result::ok)
+    ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .add_custom_ignore_filename(".archiveignore")
+        .build()
+        .filter_map(Result::ok)
 }
 
 fn index(dir: &Path) -> Result<usize> {

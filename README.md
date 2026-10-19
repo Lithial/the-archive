@@ -45,6 +45,7 @@ The saving is an estimate and an upper bound: tokens are bytes/4, and it assumes
 ## How it works
 
 - Files are split into 40-line passages with 10 lines of overlap and stored in SQLite FTS5. Ranking is BM25.
+- Respects `.gitignore`. To leave out tracked folders like vendor code, add a `.archiveignore` in the repo root with the same syntax (`vendor/`, `third_party/`, `*.min.js`). Editing it triggers a rebuild on the next query.
 - Identifiers and paths are split (`useRemovePerson.ts` → `use Remove Person`) so plain-English queries hit file and symbol names.
 - Test, story and fixture files rank at 0.8× so the implementation wins a tie.
 - `def` uses tree-sitter. TypeScript, JavaScript and GDScript so far; another language is a grammar crate and a few node names.
