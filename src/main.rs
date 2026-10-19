@@ -84,12 +84,27 @@ fn db_path(dir: &Path) -> Result<PathBuf> {
     Ok(cache.join(format!("{name}.db")))
 }
 
+/// Opens the index, rebuilding it first if any file or directory is newer than it.
+/// Directory mtimes catch deletes and checkouts. Lives here so no caller can skip it.
 fn open(dir: &Path) -> Result<Connection> {
     let p = db_path(dir)?;
-    if !p.exists() {
-        return Err(anyhow!("no index for {}; run `archive index {}` first", dir.display(), dir.display()));
+    let built = match std::fs::metadata(&p) {
+        Ok(m) => Some(m.modified()?),
+        Err(_) => None,
+    };
+    let stale = match built {
+        None => true,
+        Some(built) => walk(dir).any(|e| e.metadata().ok().and_then(|m| m.modified().ok()).map_or(true, |t| t > built)),
+    };
+    if stale {
+        let n = index(dir)?;
+        eprintln!("archive: index was stale, rebuilt ({n} files)");
     }
     Ok(Connection::open(p)?)
+}
+
+fn walk(root: &Path) -> impl Iterator<Item = ignore::DirEntry> {
+    ignore::WalkBuilder::new(root).hidden(true).build().filter_map(Result::ok)
 }
 
 fn index(dir: &Path) -> Result<usize> {
@@ -104,8 +119,7 @@ fn index(dir: &Path) -> Result<usize> {
     )?;
     let tx = db.transaction()?;
     let mut n = 0;
-    for entry in ignore::WalkBuilder::new(&root).hidden(true).build() {
-        let entry = entry?;
+    for entry in walk(&root) {
         if !entry.file_type().map_or(false, |t| t.is_file()) {
             continue;
         }

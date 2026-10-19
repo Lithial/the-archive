@@ -32,7 +32,7 @@ Tools exposed: `search`, `def`, `reindex`.
 - Identifiers and paths are split (`useRemovePerson.ts` → `use Remove Person`) so plain-English queries hit file and symbol names.
 - Test, story and fixture files rank at 0.8× so the implementation wins a tie.
 - `def` uses tree-sitter. TypeScript and JavaScript only for now; another language is a grammar crate and a few node names.
-- The index lives in `~/.cache/archive/<path>.db`. Reindex is a full rebuild.
+- The index lives in `~/.cache/archive/<path>.db`. Every `search`/`def`/MCP call first checks whether any file or directory is newer than the index and rebuilds if so, so a checkout, merge or worktree switch is never missed. The check is ~40 ms; a rebuild is a few seconds. `archive index` forces one.
 
 ## What it doesn't do
 
