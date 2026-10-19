@@ -564,52 +564,45 @@ fn index(dir: &Path) -> Result<usize> {
          // refs_name index is built after the inserts; that is faster than maintaining it per row
     )?;
     let tx = db.transaction()?;
+    let files: Vec<PathBuf> = walk(&root)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()) && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_BYTES))
+        .map(ignore::DirEntry::into_path)
+        .collect();
+    // Parsing is most of the work and runs on every core; SQLite has one writer, this thread.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut n = 0;
-    for entry in walk(&root) {
-        if !entry.file_type().map_or(false, |t| t.is_file()) {
-            continue;
+    std::thread::scope(|s| -> Result<()> {
+        let (send, recv) = std::sync::mpsc::sync_channel::<FileRows>(256);
+        for _ in 0..threads {
+            let (send, next, files, root) = (send.clone(), &next, &files, &root);
+            s.spawn(move || loop {
+                let Some(p) = files.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) else { break };
+                if let Some(rows) = file_rows(root, p) {
+                    if send.send(rows).is_err() {
+                        break; // writer failed; its error is returned below
+                    }
+                }
+            });
         }
-        if entry.metadata()?.len() > MAX_FILE_BYTES {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue }; // skips binaries
-        if text.bytes().any(|b| b == 0) {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(&root)?.to_string_lossy().into_owned();
-        let lines: Vec<&str> = text.lines().collect();
-        let mut start = 0;
-        while start < lines.len() {
-            let end = (start + WINDOW).min(lines.len());
-            let body = lines[start..end].join("\n");
-            tx.execute(
-                "INSERT INTO chunks(path,start,end,body,words) VALUES(?1,?2,?3,?4,?5)",
-                // path goes in too: file names carry most of the signal in real repos
-                params![rel, start + 1, end, body, format!("{}\n{}", split_idents(&rel), split_idents(&body))],
-            )?;
-            if end == lines.len() {
-                break;
+        drop(send);
+        let mut chunk = tx.prepare_cached("INSERT INTO chunks(path,start,end,body,words) VALUES(?1,?2,?3,?4,?5)")?;
+        let mut sym = tx.prepare_cached("INSERT INTO symbols VALUES(?1,?2,?3,?4,?5)")?;
+        let mut rf = tx.prepare_cached("INSERT INTO refs VALUES(?1,?2,?3,?4,?5,?6)")?;
+        for f in recv {
+            for (start, end, body, words) in &f.chunks {
+                chunk.execute(params![f.rel, start, end, body, words])?;
             }
-            start += STEP;
-        }
-        if rel.ends_with(".graphql") || rel.ends_with(".gql") {
-            for s in graphql_symbols(&text) {
-                tx.execute("INSERT INTO symbols VALUES(?1,?2,?3,?4,?5)", params![s.name, s.kind, rel, s.line, s.signature])?;
+            for s in &f.syms {
+                sym.execute(params![s.name, s.kind, f.rel, s.line, s.signature])?;
             }
-        }
-        if let Some(lang) = ts_language(entry.path()) {
-            for s in symbols(&text, lang.clone()) {
-                tx.execute(
-                    "INSERT INTO symbols VALUES(?1,?2,?3,?4,?5)",
-                    params![s.name, s.kind, rel, s.line, s.signature],
-                )?;
+            for r in &f.refs {
+                rf.execute(params![r.name, f.rel, r.line, r.caller, r.text, r.plain])?;
             }
-            for r in refs(&text, lang) {
-                tx.execute("INSERT INTO refs VALUES(?1,?2,?3,?4,?5,?6)", params![r.name, rel, r.line, r.caller, r.text, r.plain])?;
-            }
+            n += 1;
         }
-        n += 1;
-    }
+        Ok(())
+    })?;
     for (d, rel) in dep_dirs(&root) {
         n += index_dep(&tx, &d, &rel)?;
     }
@@ -619,6 +612,46 @@ fn index(dir: &Path) -> Result<usize> {
     )?;
     tx.commit()?;
     Ok(n)
+}
+
+struct FileRows {
+    rel: String,
+    chunks: Vec<(usize, usize, String, String)>,
+    syms: Vec<Sym>,
+    refs: Vec<Ref>,
+}
+
+/// Everything one file contributes to the index. None for binaries and unreadable files.
+fn file_rows(root: &Path, p: &Path) -> Option<FileRows> {
+    let text = std::fs::read_to_string(p).ok()?;
+    if text.bytes().any(|b| b == 0) {
+        return None;
+    }
+    let rel = p.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+    let rel_words = split_idents(&rel);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut chunks = vec![];
+    let mut start = 0;
+    while start < lines.len() {
+        let end = (start + WINDOW).min(lines.len());
+        let body = lines[start..end].join("\n");
+        // path goes in too: file names carry most of the signal in real repos
+        let words = format!("{rel_words}\n{}", split_idents(&body));
+        chunks.push((start + 1, end, body, words));
+        if end == lines.len() {
+            break;
+        }
+        start += STEP;
+    }
+    let (mut syms, mut refs) = (vec![], vec![]);
+    if rel.ends_with(".graphql") || rel.ends_with(".gql") {
+        syms = graphql_symbols(&text);
+    }
+    if let Some(tree) = ts_language(p).and_then(|l| parse(&text, l)) {
+        syms = symbols_in(&text, &tree);
+        refs = refs_in(&text, &tree);
+    }
+    Some(FileRows { rel, chunks, syms, refs })
 }
 
 /// `getUserName` -> `get User Name`, so a query for "user name" matches identifiers.
@@ -839,12 +872,17 @@ fn ts_language(p: &Path) -> Option<tree_sitter::Language> {
     }
 }
 
-fn symbols(src: &str, lang: tree_sitter::Language) -> Vec<Sym> {
+fn parse(src: &str, lang: tree_sitter::Language) -> Option<tree_sitter::Tree> {
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&lang).is_err() {
-        return vec![];
-    }
-    let Some(tree) = parser.parse(src, None) else { return vec![] };
+    parser.set_language(&lang).ok()?;
+    parser.parse(src, None)
+}
+
+fn symbols(src: &str, lang: tree_sitter::Language) -> Vec<Sym> {
+    parse(src, lang).map_or(vec![], |t| symbols_in(src, &t))
+}
+
+fn symbols_in(src: &str, tree: &tree_sitter::Tree) -> Vec<Sym> {
     let mut out = vec![];
     let mut cursor = tree.walk();
     let mut stack = vec![tree.root_node()];
@@ -910,15 +948,16 @@ struct Ref {
 
 /// Uses of a name: calls, `new`, JSX components, type references. `caller` is the enclosing
 /// function or class, which is the part an agent wants before a refactor.
+#[cfg(test)]
 fn refs(src: &str, lang: tree_sitter::Language) -> Vec<Ref> {
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&lang).is_err() {
-        return vec![];
-    }
-    let Some(tree) = parser.parse(src, None) else { return vec![] };
+    parse(src, lang).map_or(vec![], |t| refs_in(src, &t))
+}
+
+fn refs_in(src: &str, tree: &tree_sitter::Tree) -> Vec<Ref> {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = vec![];
-    let mut stack = vec![(tree.root_node(), String::new())];
+    // Rc: every node on the stack carries its enclosing function name; cloning a String per node was slow
+    let mut stack: Vec<(tree_sitter::Node, std::rc::Rc<str>)> = vec![(tree.root_node(), "".into())];
     while let Some((node, caller)) = stack.pop() {
         let text = |n: tree_sitter::Node| src[n.byte_range()].to_string();
         // For a.b.c() the name is c.
@@ -957,11 +996,11 @@ fn refs(src: &str, lang: tree_sitter::Language) -> Vec<Ref> {
                 name,
                 plain,
                 line: row + 1,
-                caller: caller.clone(),
+                caller: caller.to_string(),
                 text: lines.get(row).unwrap_or(&"").trim().chars().take(160).collect(),
             });
         }
-        let inner = def_name(node).map_or(caller, text);
+        let inner = def_name(node).map_or(caller, |n| src[n.byte_range()].into());
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             stack.push((child, inner.clone()));
