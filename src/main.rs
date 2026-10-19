@@ -470,30 +470,93 @@ fn db_path(dir: &Path) -> Result<PathBuf> {
     Ok(cache.join(format!("{name}.db")))
 }
 
-/// Opens the index, rebuilding it first if any file or directory is newer than it.
-/// Directory mtimes catch deletes and checkouts. Lives here so no caller can skip it.
+/// Above this many changed files (a branch switch) a full rebuild is faster than per-file updates.
+const MAX_INCREMENTAL: usize = 300;
+
+/// Opens the index, bringing it up to date first: files whose mtime or size changed are
+/// reindexed, deleted ones dropped. Lives here so no caller can skip it.
 fn open(dir: &Path) -> Result<Connection> {
     let p = db_path(dir)?;
-    let built = match std::fs::metadata(&p) {
-        Ok(m) => Some(m.modified()?),
-        Err(_) => None,
-    };
-    let stale = match built {
-        None => true,
-        Some(built) => {
+    let built = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+    let mut db = Connection::open(&p)?;
+    let has_files: bool = db.query_row("SELECT count(*) FROM sqlite_master WHERE name = 'files'", [], |r| r.get(0))?;
+    let full = match built {
+        Some(built) if has_files => {
             let newer = |m: std::fs::Metadata| m.modified().map_or(true, |t| t > built);
             // Hidden files and node_modules are outside the walk; check them directly.
             // An install or upgrade rewrites a package's package.json.
             [".archiveignore", ".archivedeps"].iter().any(|f| std::fs::metadata(dir.join(f)).map_or(false, newer))
                 || dep_dirs(dir).iter().any(|(d, _)| std::fs::metadata(d.join("package.json")).map_or(true, newer))
-                || walk(dir).any(|e| e.metadata().map_or(true, newer))
         }
+        _ => true, // missing, or built by a version without the files table
     };
-    if stale {
-        let n = index(dir)?;
-        eprintln!("archive: index was stale, rebuilt ({n} files)");
+    if !full {
+        let root = dir.canonicalize()?;
+        let on_disk = source_files(&root);
+        let mut known: std::collections::HashMap<String, (i64, i64)> = Default::default();
+        for row in db.prepare("SELECT path, mtime, size FROM files")?.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))? {
+            let (k, v) = row?;
+            known.insert(k, v);
+        }
+        let changed: Vec<&(PathBuf, String, i64, i64)> = on_disk.iter().filter(|(_, rel, m, s)| known.remove(rel) != Some((*m, *s))).collect();
+        let deleted: Vec<String> = known.into_keys().collect();
+        if changed.len() + deleted.len() <= MAX_INCREMENTAL {
+            if !changed.is_empty() || !deleted.is_empty() {
+                let tx = db.transaction()?;
+                let gone = json!(changed.iter().map(|f| &f.1).chain(&deleted).collect::<Vec<_>>()).to_string();
+                for t in ["chunks", "symbols", "refs", "files"] {
+                    tx.execute(&format!("DELETE FROM {t} WHERE path IN (SELECT value FROM json_each(?1))"), [&gone])?;
+                }
+                for f in &changed {
+                    insert_file(&tx, &root, f)?;
+                }
+                tx.commit()?;
+            }
+            return Ok(db);
+        }
     }
+    drop(db);
+    let n = index(dir)?;
+    eprintln!("archive: index was stale, rebuilt ({n} files)");
     Ok(Connection::open(p)?)
+}
+
+/// (path, relative path, mtime ns, size) of every file the index covers.
+fn source_files(root: &Path) -> Vec<(PathBuf, String, i64, i64)> {
+    walk(root)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let m = e.metadata().ok().filter(|m| m.len() <= MAX_FILE_BYTES)?;
+            let mtime = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as i64;
+            let rel = e.path().strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            Some((e.into_path(), rel, mtime, m.len() as i64))
+        })
+        .collect()
+}
+
+/// Records the file, then its rows. Binaries get only the `files` row, so they don't look changed next time.
+fn insert_file(tx: &rusqlite::Transaction, root: &Path, f: &(PathBuf, String, i64, i64)) -> Result<()> {
+    tx.prepare_cached("INSERT INTO files VALUES(?1,?2,?3)")?.execute(params![f.1, f.2, f.3])?;
+    if let Some(rows) = file_rows(root, &f.0) {
+        insert_rows(tx, &rows)?;
+    }
+    Ok(())
+}
+
+fn insert_rows(tx: &rusqlite::Transaction, f: &FileRows) -> Result<()> {
+    let mut chunk = tx.prepare_cached("INSERT INTO chunks(path,start,end,body,words) VALUES(?1,?2,?3,?4,?5)")?;
+    for (start, end, body, words) in &f.chunks {
+        chunk.execute(params![f.rel, start, end, body, words])?;
+    }
+    let mut sym = tx.prepare_cached("INSERT INTO symbols VALUES(?1,?2,?3,?4,?5)")?;
+    for s in &f.syms {
+        sym.execute(params![s.name, s.kind, f.rel, s.line, s.signature])?;
+    }
+    let mut rf = tx.prepare_cached("INSERT INTO refs VALUES(?1,?2,?3,?4,?5,?6)")?;
+    for r in &f.refs {
+        rf.execute(params![r.name, f.rel, r.line, r.caller, r.text, r.plain])?;
+    }
+    Ok(())
 }
 
 /// Packages listed in `.archivedeps`, one per line, found in the `node_modules` next to any
@@ -560,46 +623,36 @@ fn index(dir: &Path) -> Result<usize> {
         "CREATE VIRTUAL TABLE chunks USING fts5(path UNINDEXED, start UNINDEXED, end UNINDEXED, body, words, tokenize='unicode61');
          CREATE TABLE symbols(name TEXT, kind TEXT, path TEXT, line INTEGER, signature TEXT);
          CREATE INDEX symbols_name ON symbols(name);
-         CREATE TABLE refs(name TEXT, path TEXT, line INTEGER, caller TEXT, text TEXT, plain INTEGER);",
-         // refs_name index is built after the inserts; that is faster than maintaining it per row
+         CREATE TABLE refs(name TEXT, path TEXT, line INTEGER, caller TEXT, text TEXT, plain INTEGER);
+         CREATE TABLE files(path TEXT PRIMARY KEY, mtime INTEGER, size INTEGER);",
+         // the other indexes are built after the inserts; that is faster than maintaining them per row
     )?;
     let tx = db.transaction()?;
-    let files: Vec<PathBuf> = walk(&root)
-        .filter(|e| e.file_type().is_some_and(|t| t.is_file()) && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_BYTES))
-        .map(ignore::DirEntry::into_path)
-        .collect();
+    let files = source_files(&root);
     // Parsing is most of the work and runs on every core; SQLite has one writer, this thread.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut n = 0;
     std::thread::scope(|s| -> Result<()> {
-        let (send, recv) = std::sync::mpsc::sync_channel::<FileRows>(256);
+        let (send, recv) = std::sync::mpsc::sync_channel(256);
         for _ in 0..threads {
             let (send, next, files, root) = (send.clone(), &next, &files, &root);
-            s.spawn(move || loop {
-                let Some(p) = files.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) else { break };
-                if let Some(rows) = file_rows(root, p) {
-                    if send.send(rows).is_err() {
+            s.spawn(move || {
+                while let Some(f) = files.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                    if send.send((f, file_rows(root, &f.0))).is_err() {
                         break; // writer failed; its error is returned below
                     }
                 }
             });
         }
         drop(send);
-        let mut chunk = tx.prepare_cached("INSERT INTO chunks(path,start,end,body,words) VALUES(?1,?2,?3,?4,?5)")?;
-        let mut sym = tx.prepare_cached("INSERT INTO symbols VALUES(?1,?2,?3,?4,?5)")?;
-        let mut rf = tx.prepare_cached("INSERT INTO refs VALUES(?1,?2,?3,?4,?5,?6)")?;
-        for f in recv {
-            for (start, end, body, words) in &f.chunks {
-                chunk.execute(params![f.rel, start, end, body, words])?;
+        let mut file = tx.prepare_cached("INSERT INTO files VALUES(?1,?2,?3)")?;
+        for (f, rows) in recv {
+            file.execute(params![f.1, f.2, f.3])?;
+            if let Some(rows) = rows {
+                insert_rows(&tx, &rows)?;
+                n += 1;
             }
-            for s in &f.syms {
-                sym.execute(params![s.name, s.kind, f.rel, s.line, s.signature])?;
-            }
-            for r in &f.refs {
-                rf.execute(params![r.name, f.rel, r.line, r.caller, r.text, r.plain])?;
-            }
-            n += 1;
         }
         Ok(())
     })?;
@@ -607,8 +660,9 @@ fn index(dir: &Path) -> Result<usize> {
         n += index_dep(&tx, &d, &rel)?;
     }
     tx.execute_batch(
-        "DELETE FROM refs WHERE plain AND name NOT IN (SELECT name FROM symbols);
-         CREATE INDEX refs_name ON refs(name);",
+        "CREATE INDEX refs_name ON refs(name);
+         CREATE INDEX refs_path ON refs(path);
+         CREATE INDEX symbols_path ON symbols(path);",
     )?;
     tx.commit()?;
     Ok(n)
@@ -825,12 +879,16 @@ struct Use {
 
 /// Exact name only: substring matches on "get" would return half the repo.
 fn find_refs(db: &Connection, name: &str, limit: usize) -> Result<(Vec<Use>, usize)> {
-    let total: usize = db.query_row("SELECT count(*) FROM refs WHERE name = ?1", [name], |r| r.get(0))?;
-    let mut stmt = db.prepare(
+    // Bare mentions only count for names defined in the repo or an indexed dependency; otherwise
+    // `refs map` would list every variable called map. Filtered here, not at index time, so an
+    // incremental update that adds the definition brings them back.
+    let only = "name = ?1 AND (NOT plain OR EXISTS (SELECT 1 FROM symbols WHERE name = ?1))";
+    let total: usize = db.query_row(&format!("SELECT count(*) FROM refs WHERE {only}"), [name], |r| r.get(0))?;
+    let mut stmt = db.prepare(&format!(
         // implementation before tests, same order as search
-        "SELECT path, line, caller, text FROM refs WHERE name = ?1
-         ORDER BY (path GLOB '*.test.*' OR path GLOB '*.spec.*' OR path GLOB '*__tests__*' OR path GLOB '*.stories.*'), path, line LIMIT ?2",
-    )?;
+        "SELECT path, line, caller, text FROM refs WHERE {only}
+         ORDER BY (path GLOB '*.test.*' OR path GLOB '*.spec.*' OR path GLOB '*__tests__*' OR path GLOB '*.stories.*'), path, line LIMIT ?2"
+    ))?;
     let rows = stmt.query_map(params![name, limit as i64], |r| {
         Ok(Use { path: r.get(0)?, line: r.get(1)?, caller: r.get(2)?, text: r.get(3)? })
     })?;
@@ -1222,6 +1280,32 @@ mod tests {
         let r = refs(src, tree_sitter_gdscript::LANGUAGE.into());
         let got: Vec<_> = r.iter().filter(|r| !r.plain).map(|r| (r.name.as_str(), r.line, r.caller.as_str())).collect();
         assert_eq!(got, vec![("spawn", 2, "_ready"), ("hit", 3, "_ready"), ("init", 4, "_ready")]);
+    }
+
+    #[test]
+    fn open_updates_changed_and_deleted_files() {
+        let tmp = std::env::temp_dir().join(format!("archive-test-{}", std::process::id()));
+        let (repo, cache) = (tmp.join("repo"), tmp.join("cache"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &cache); // only this test touches the cache
+        std::fs::write(repo.join("a.ts"), "export function alpha() {}\nconst x = { beta };\n").unwrap();
+        let defs = |n: &str| def(&open(&repo).unwrap(), n).unwrap().len();
+        let uses = |n: &str| find_refs(&open(&repo).unwrap(), n, 50).unwrap().1;
+        assert_eq!(defs("alpha"), 1);
+        assert_eq!(uses("beta"), 0, "bare mention of an undefined name is hidden");
+
+        std::fs::write(repo.join("b.ts"), "export function beta() { alpha() }\n").unwrap();
+        assert_eq!(defs("beta"), 1, "new file picked up");
+        assert_eq!(uses("alpha"), 1);
+        assert_eq!(uses("beta"), 1, "mention in the unchanged file shows once beta is defined");
+
+        std::fs::remove_file(repo.join("a.ts")).unwrap();
+        assert_eq!(defs("alpha"), 0, "deleted file dropped");
+        assert_eq!(uses("beta"), 0);
+        let db = open(&repo).unwrap();
+        let n: i64 = db.query_row("SELECT count(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

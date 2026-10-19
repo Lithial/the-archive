@@ -72,7 +72,7 @@ node_modules/zustand/react.d.ts:13  [variable · zustand@5.0.12] create: Create
 apps/my-circles/node_modules/zustand/react.d.ts:13  [variable · zustand@5.0.11] create: Create
 ```
 
-Every `node_modules` next to a `package.json` is checked, so an app pinned to a different version shows up separately. Only `.d.ts` files are read, for `def`; they are left out of `search` and `refs` so library code does not outrank yours. Repo symbols sort before dependency symbols. An install or upgrade triggers a rebuild. It costs index time: @apollo/client and zustand took a 4k-file index from 6 s to 10 s.
+Every `node_modules` next to a `package.json` is checked, so an app pinned to a different version shows up separately. Only `.d.ts` files are read, for `def`; they are left out of `search` and `refs` so library code does not outrank yours. Repo symbols sort before dependency symbols. An install or upgrade triggers a full rebuild. On a 4k-file monorepo with @apollo/client and zustand listed, a full rebuild takes about 3.7 s on 6 cores.
 
 ## Condensed command output
 
@@ -148,7 +148,7 @@ The saving is an estimate and an upper bound: tokens are bytes/4, and it assumes
 - Identifiers and paths are split (`useRemovePerson.ts` → `use Remove Person`) so plain-English queries hit file and symbol names.
 - Test, story and fixture files rank at 0.8× so the implementation wins a tie.
 - `def` uses tree-sitter. TypeScript, JavaScript and GDScript so far; another language is a grammar crate and a few node names.
-- The index lives in `~/.cache/archive/<path>.db`. Every `search`/`def`/MCP call first checks whether any file or directory is newer than the index and rebuilds if so, so a checkout, merge or worktree switch is never missed. The check is ~40 ms; a rebuild is a few seconds. `archive index` forces one.
+- The index lives in `~/.cache/archive/<path>.db`. Every `search`/`def`/`refs`/MCP call first compares each file's mtime and size with what was indexed, then reindexes only the files that changed and drops deleted ones. On a 4k-file repo the check is ~60 ms and a query right after editing a file is 100–200 ms. A branch switch touching more than 300 files, or a change to `.archiveignore`/`.archivedeps`, triggers a full rebuild instead (~3.5 s; files are parsed on every core). `archive index` forces a full rebuild.
 
 ## What it doesn't do
 
