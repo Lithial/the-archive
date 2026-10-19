@@ -85,7 +85,7 @@ fn main() -> Result<()> {
             let defs = def(&open(&dir)?, &name)?;
             log(&dir, "def", &name, t, defs.iter().map(|d| (d.path.as_str(), d.signature.len())))?;
             for d in defs {
-                println!("{}:{}  [{}] {}", d.path, d.line, d.kind, d.signature);
+                println!("{d}");
             }
         }
         Cmd::Refs { name, limit, dir } => {
@@ -419,6 +419,11 @@ fn index(dir: &Path) -> Result<usize> {
             }
             start += STEP;
         }
+        if rel.ends_with(".graphql") || rel.ends_with(".gql") {
+            for s in graphql_symbols(&text) {
+                tx.execute("INSERT INTO symbols VALUES(?1,?2,?3,?4,?5)", params![s.name, s.kind, rel, s.line, s.signature])?;
+            }
+        }
         if let Some(lang) = ts_language(entry.path()) {
             for s in symbols(&text, lang.clone()) {
                 tx.execute(
@@ -497,18 +502,112 @@ struct Def {
     line: i64,
     kind: String,
     signature: String,
+    /// other places with the identical definition (copied schemas, the same package in two apps)
+    also: Vec<String>,
+}
+
+impl std::fmt::Display for Def {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}:{}  [{}] {}", self.path, self.line, self.kind, self.signature)?;
+        if !self.also.is_empty() {
+            write!(f, "\n  same in: {}", self.also.join(", "))?;
+        }
+        Ok(())
+    }
 }
 
 fn def(db: &Connection, name: &str) -> Result<Vec<Def>> {
     let mut stmt = db.prepare(
         "SELECT path, line, kind, signature FROM symbols
          WHERE name = ?1 OR name LIKE ?2
-         ORDER BY name = ?1 DESC, path LIKE '%node_modules/%', path LIMIT 20",
+         ORDER BY name = ?1 DESC, path LIKE '%node_modules/%', path LIMIT 60",
     )?;
     let rows = stmt.query_map(params![name, format!("%{name}%")], |r| {
-        Ok(Def { path: r.get(0)?, line: r.get(1)?, kind: r.get(2)?, signature: r.get(3)? })
+        Ok(Def { path: r.get(0)?, line: r.get(1)?, kind: r.get(2)?, signature: r.get(3)?, also: vec![] })
     })?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    let mut out: Vec<Def> = vec![];
+    for d in rows {
+        let d = d?;
+        // kind without the @version, so two versions with the same signature still collapse
+        let base = |k: &str| k.split(" · ").next().unwrap_or("").to_string();
+        let full = out.len() >= 20;
+        match out.iter_mut().find(|o| o.signature == d.signature && base(&o.kind) == base(&d.kind)) {
+            Some(o) => o.also.push(format!("{}:{}", d.path, d.line)),
+            None if !full => out.push(d),
+            None => {}
+        }
+    }
+    Ok(out)
+}
+
+const GQL_KINDS: &[&str] = &["type", "input", "enum", "interface", "union", "scalar", "directive"];
+
+/// GraphQL SDL by line, no grammar: printed schemas put definitions at column 0 and close them
+/// with `}` at column 0. Each type is one symbol whose signature is the whole block, so an agent
+/// gets one input type instead of a 300 KB file. Query/Mutation/Subscription fields are symbols too.
+fn graphql_symbols(text: &str) -> Vec<Sym> {
+    const MAX_LINES: usize = 80;
+    let lines: Vec<&str> = text.lines().collect();
+    let ident = |s: &str| s.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>();
+    // root type name -> operation; `schema { query: RootQueryType }` renames them
+    let mut roots: Vec<(String, String)> = ["query", "mutation", "subscription"]
+        .iter()
+        .map(|op| (op[..1].to_uppercase() + &op[1..], op.to_string()))
+        .collect();
+    if let Some(s) = lines.iter().position(|l| l.starts_with("schema ") || l.starts_with("schema{")) {
+        for l in lines[s + 1..].iter().take_while(|l| !l.starts_with('}')) {
+            if let Some((op, ty)) = l.split_once(':') {
+                let op = op.trim().to_string();
+                roots.retain(|(_, o)| *o != op);
+                roots.push((ident(ty.trim()), op));
+            }
+        }
+    }
+    let mut out = vec![];
+    for (i, l) in lines.iter().enumerate() {
+        let head = l.strip_prefix("extend ").unwrap_or(l);
+        let Some(kw) = GQL_KINDS.iter().find(|k| head.starts_with(&format!("{k} "))) else { continue };
+        let name = ident(head[kw.len() + 1..].trim_start_matches('@'));
+        if name.is_empty() {
+            continue;
+        }
+        let end = if l.trim_end().ends_with('{') {
+            (i + 1..lines.len()).find(|&j| lines[j].starts_with('}')).unwrap_or(lines.len() - 1)
+        } else {
+            i
+        };
+        // a """description""" directly above belongs to the type
+        let mut start = i;
+        if i > 0 && lines[i - 1].starts_with("\"\"\"") {
+            start = i - 1;
+            if lines[start].trim() == "\"\"\"" {
+                start = (0..start).rev().find(|&j| lines[j].starts_with("\"\"\"")).unwrap_or(start);
+            }
+        }
+        let block = &lines[start..=end];
+        let mut sig = block[..block.len().min(MAX_LINES)].join("\n");
+        if block.len() > MAX_LINES {
+            sig += &format!("\n  … {} more lines, read {}+", block.len() - MAX_LINES, start + MAX_LINES + 1);
+        }
+        out.push(Sym { name: name.clone(), kind: format!("graphql {kw}"), line: i + 1, signature: sig });
+
+        if let Some((_, op)) = roots.iter().find(|(t, _)| *kw == "type" && *t == name) {
+            // fields sit at the block's first indent; deeper lines are their multi-line args
+            let body = &lines[i + 1..end];
+            let indent = body.iter().find(|l| !l.trim().is_empty()).map_or(0, |l| l.len() - l.trim_start().len());
+            let is_field = |l: &str| l.len() > indent && l[..indent].trim().is_empty() && l[indent..].starts_with(|c: char| c.is_alphabetic());
+            for (k, f) in body.iter().enumerate().filter(|(_, l)| is_field(l)) {
+                let stop = body[k + 1..].iter().position(|l| is_field(l) || l.trim_start().starts_with('"')).map_or(body.len(), |p| k + 1 + p);
+                out.push(Sym {
+                    name: ident(f.trim_start()),
+                    kind: format!("graphql {op}"),
+                    line: i + 2 + k,
+                    signature: body[k..stop].iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ").trim().replace("( ", "(").replace(" )", ")"),
+                });
+            }
+        }
+    }
+    out
 }
 
 struct Use {
@@ -770,7 +869,7 @@ fn call(dir: &Path, params: &Value) -> Result<String> {
             if defs.is_empty() {
                 return Ok("no definition found".into());
             }
-            Ok(defs.iter().map(|d| format!("{}:{}  [{}] {}", d.path, d.line, d.kind, d.signature)).collect::<Vec<_>>().join("\n"))
+            Ok(defs.iter().map(Def::to_string).collect::<Vec<_>>().join("\n"))
         }
         "refs" => {
             let name = args["name"].as_str().ok_or_else(|| anyhow!("name required"))?;
@@ -839,6 +938,25 @@ mod tests {
         assert_eq!(find("useQuery").signature, "function useQuery<T>( query: DocumentNode, options?: Opts<T> ): Result<T>;");
         assert!(find("create").signature.contains("Store<T>"));
         assert!(find("query").signature.contains("Promise<T>"));
+    }
+
+    #[test]
+    fn finds_graphql_types() {
+        let src = "\"\"\"\nPassword change\n\"\"\"\ninput PersonUpdatePasswordInput {\n  password: String!\n}\n\ntype Mutation {\n  \"\"\"Change it\"\"\"\n  personUpdatePassword(\n    input: PersonUpdatePasswordInput!\n  ): Payload\n  ping: Boolean\n}\nscalar Date\nextend type Person @key(fields: \"id\") {\n  x: Int\n}\n";
+        let s = graphql_symbols(src);
+        let got: Vec<_> = s.iter().map(|s| (s.name.as_str(), s.kind.as_str(), s.line)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("PersonUpdatePasswordInput", "graphql input", 4), ("Mutation", "graphql type", 8),
+                ("personUpdatePassword", "graphql mutation", 10), ("ping", "graphql mutation", 13),
+                ("Date", "graphql scalar", 15), ("Person", "graphql type", 16),
+            ]
+        );
+        assert!(s[0].signature.starts_with("\"\"\"\nPassword change") && s[0].signature.ends_with('}'));
+        assert_eq!(s[2].signature, "personUpdatePassword(input: PersonUpdatePasswordInput!): Payload");
+        let s = graphql_symbols("schema {\n  query: RootQueryType\n}\ntype RootQueryType {\n  me: Person\n}\n");
+        assert!(s.iter().any(|s| s.name == "me" && s.kind == "graphql query"), "renamed root type");
     }
 
     #[test]

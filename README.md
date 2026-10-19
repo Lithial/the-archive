@@ -33,6 +33,17 @@ Hook it into Claude Code or Cursor by adding to `.mcp.json`:
 
 Tools exposed: `search`, `def`, `refs`, `reindex`.
 
+### GraphQL schemas
+
+`def` also reads `.graphql`/`.gql` files. A type, input or enum comes back as its whole block with descriptions; a query, mutation or subscription comes back as one line with its arguments:
+
+```
+$ archive def personUpdatePassword
+apps/my-circles/schema.graphql:852  [graphql mutation] personUpdatePassword(input: PersonUpdatePasswordInput!): PersonUpdatePasswordPayload!
+```
+
+That is about 1 KB instead of a 300 KB schema file. When several apps carry the same definition, it is shown once with `same in:` listing the other copies, so differing copies stand out. Root types renamed in a `schema { }` block are followed. The parser expects printed SDL (definitions at column 0, closing `}` at column 0), which is what introspection dumps and codegen produce; hand-written schemas laid out differently may be missed.
+
 ### Dependency types
 
 List packages in `.archivedeps` at the repo root, one per line, and `def` also returns their type declarations, with the version actually installed:
