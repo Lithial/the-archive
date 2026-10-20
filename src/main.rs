@@ -37,7 +37,7 @@ enum Cmd {
         #[arg(long)]
         update: bool,
     },
-    /// Install the pi extension: archive MCP tools, condensed test/build output, grep hints, index warm-up.
+    /// Install the pi extension: def/refs/search_code/why tools, condensed test/build output, grep hints, index warm-up.
     Install {
         #[arg(value_parser = ["pi"])]
         agent: String,

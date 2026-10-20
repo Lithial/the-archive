@@ -33,10 +33,10 @@ archive install pi
 
 This writes `~/.pi/agent/extensions/archive.ts` and adds a short section to `~/.pi/agent/AGENTS.md` on when to use each tool. Reinstalling replaces both; delete them to uninstall. In any git repo, the extension:
 
-- registers the archive MCP server for the repo root, so every project gets `search`, `def`, `refs` and `why` without per-project config
+- adds `def`, `refs`, `search_code` and `why` as ordinary pi tools, so they sit in the model's tool list with their descriptions. (An MCP server would work too, but behind a gateway such as pi-mcp-adapter the model has to remember the server exists; in practice it didn't.)
 - updates the index in the background when a session starts, so the first query doesn't wait for a rebuild
 - rewrites test, build, lint and typecheck commands (`yarn test`, `npx vitest run`, `tsc`, `eslint`, `cargo test`, `go test`, `pytest`, …) to `archive run -- …`. Each `&&` step is wrapped separately. Commands with pipes, redirects, `;` or watch/dev flags are left alone, and `ARCHIVE_RAW=1` opts out
-- after a grep for something shaped like a symbol (`useOrganizations`, `has_consent`), adds one line pointing at `def` and `refs`, at most three times a session
+- after a grep whose pattern is shaped like a symbol (`useOrganizations`, `has_consent`), adds one line pointing at `def` and `refs`, at most three times a session. Greps after a pipe or with `-v` are filters, not searches, and get no hint
 
 The extension calls the binary it was installed from, so rerun `archive install pi` if you move it.
 
