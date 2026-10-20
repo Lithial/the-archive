@@ -261,7 +261,7 @@ fn interesting(l: &str) -> bool {
         return true;
     }
     // file:line or file(line,col) in source we care about
-    const EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".gd", ".py", ".go"];
+    const EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".gd", ".py", ".go", ".ex", ".exs", ".erl"];
     EXTS.iter().any(|e| {
         l.match_indices(e).any(|(i, _)| {
             let rest = &l[i + e.len()..];
@@ -979,6 +979,8 @@ fn ts_language(p: &Path) -> Option<tree_sitter::Language> {
         "ts" | "mts" | "cts" | "js" | "mjs" | "cjs" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" | "jsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         "gd" => Some(tree_sitter_gdscript::LANGUAGE.into()),
+        "ex" | "exs" => Some(tree_sitter_elixir::LANGUAGE.into()),
+        "erl" | "hrl" => Some(tree_sitter_erlang::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -998,14 +1000,27 @@ fn symbols_in(src: &str, tree: &tree_sitter::Tree) -> Vec<Sym> {
     let mut cursor = tree.walk();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        if let Some(name_node) = def_name(node) {
+        if let Some(name_node) = def_name(src, node) {
             let text = &src[node.byte_range()];
-            out.push(Sym {
-                name: src[name_node.byte_range()].to_string(),
-                kind: ["_declaration", "_declarator", "_definition", "_statement", "_signature"]
+            let kind: String = match elixir_def(src, node) {
+                Some("defmodule") => "module".into(),
+                Some("defp") => "private function".into(),
+                Some("defmacrop") => "private macro".into(),
+                Some("defguardp") => "private guard".into(),
+                Some("def") => "function".into(),
+                Some(d) => d[3..].into(), // defmacro -> macro, defprotocol -> protocol, ...
+                None => match ["_declaration", "_declarator", "_definition", "_statement", "_signature", "_decl"]
                     .iter()
                     .fold(node.kind(), |k, s| k.trim_end_matches(s))
-                    .replace('_', " "),
+                {
+                    "fun" => "function".into(),   // Erlang fun_decl
+                    "pp_define" => "macro".into(), // Erlang -define
+                    k => k.replace('_', " "),
+                },
+            };
+            out.push(Sym {
+                name: src[name_node.byte_range()].to_string(),
+                kind,
                 line: node.start_position().row + 1,
                 // A declaration without a body is all signature, often over several lines.
                 signature: if node.kind().ends_with("_signature") || node.kind() == "variable_declarator" && node.child_by_field_name("value").is_none() {
@@ -1022,9 +1037,83 @@ fn symbols_in(src: &str, tree: &tree_sitter::Tree) -> Vec<Sym> {
     out
 }
 
+const ELIXIR_DEFS: &[&str] = &["def", "defp", "defmacro", "defmacrop", "defguard", "defguardp", "defmodule", "defprotocol", "defimpl", "defdelegate"];
+
+/// For an Elixir `def foo(...)` call, the defining keyword. Elixir has no def syntax: `def` is a
+/// macro call, so the tree says `call` with target `def` and the head as first argument.
+fn elixir_def<'a>(src: &str, node: tree_sitter::Node) -> Option<&'a str> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let target = node.child_by_field_name("target").filter(|t| t.kind() == "identifier")?;
+    ELIXIR_DEFS.iter().copied().find(|d| *d == &src[target.byte_range()])
+}
+
+/// `foo(a, b)` in `def foo(a, b) when guard` is the head, not a call to foo.
+fn in_elixir_def_head(src: &str, node: tree_sitter::Node) -> bool {
+    let mut cur = node;
+    while let Some(n) = cur.parent() {
+        match n.kind() {
+            "arguments" => return n.parent().map_or(false, |d| elixir_def(src, d).is_some()),
+            // only the left side of `head when guard`; the guard is a real call
+            "binary_operator" if n.child_by_field_name("left") == Some(cur) => cur = n,
+            "call" if n.child_by_field_name("target") == Some(cur) => cur = n,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The name node of an Elixir definition: the module alias, or the function identifier inside
+/// `foo(args)`, `foo(args) when guard`, or a bare `foo`.
+fn elixir_def_name<'t>(src: &str, node: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+    let name = elixir_head_name(src, node)?;
+    // a multi-clause function is one symbol: report the first clause of a run only
+    let prev = node.prev_named_sibling().and_then(|p| elixir_head_name(src, p));
+    (prev.map(|p| &src[p.byte_range()]) != Some(&src[name.byte_range()])).then_some(name)
+}
+
+fn elixir_head_name<'t>(src: &str, node: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+    elixir_def(src, node)?;
+    // `arguments` is a child kind, not a field, in this grammar
+    let mut cursor = node.walk();
+    let args = node.named_children(&mut cursor).find(|c| c.kind() == "arguments")?;
+    let mut head = args.named_child(0)?;
+    loop {
+        head = match head.kind() {
+            "alias" | "identifier" => return Some(head),
+            "call" => head.child_by_field_name("target")?,
+            "binary_operator" => head.named_child(0)?, // `foo(x) when guard`, `Mod, for: T`
+            _ => return None,
+        };
+    }
+}
+
 /// The name node if `node` defines a symbol. Plain variables only count when they hold a function.
-fn def_name(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+fn def_name<'t>(src: &str, node: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
     let kind = node.kind();
+    if kind == "call" {
+        return elixir_def_name(src, node);
+    }
+    // Erlang: this grammar gives one fun_decl per clause; report the first clause of a run only
+    if kind == "fun_decl" {
+        let clause_name = |n: tree_sitter::Node<'t>| n.named_child(0).and_then(|c| c.named_child(0)).filter(|n| n.kind() == "atom");
+        let name = clause_name(node)?;
+        let prev = node.prev_named_sibling().filter(|p| p.kind() == "fun_decl").and_then(clause_name);
+        return (prev.map(|p| &src[p.byte_range()]) != Some(&src[name.byte_range()])).then_some(name);
+    }
+    if kind == "function_clause" {
+        return None; // the fun_decl above owns the name; see refs_in for the caller
+    }
+    if kind == "record_decl" {
+        return node.named_child(0);
+    }
+    if kind == "pp_define" {
+        return node.named_child(0).and_then(|lhs| lhs.named_child(0)); // macro_lhs -> name
+    }
+    if matches!(kind, "type_alias" | "opaque") {
+        return node.named_child(0).and_then(|t| t.named_child(0)); // type_name -> atom
+    }
     let named = matches!(
         kind,
         "function_declaration" | "class_declaration" | "abstract_class_declaration" | "method_definition"
@@ -1084,9 +1173,13 @@ fn refs_in(src: &str, tree: &tree_sitter::Tree) -> Vec<Ref> {
         let plain = matches!(
             node.kind(),
             "identifier" | "property_identifier" | "shorthand_property_identifier" | "shorthand_property_identifier_pattern"
+            | "alias" // Elixir module name: `Repo.get!`, `alias Foo`, `%Foo{}`, `use GenServer`
         )
-            && node.parent().and_then(def_name) != Some(node)
-            && !parent_import();
+            && node.parent().and_then(|p| def_name(src, p)) != Some(node)
+            && !parent_import()
+            // Elixir: the call arm counts `foo()` once; `def foo(a)` is a definition
+            && node.parent().map_or(true, |p| p.kind() != "call" || p.child_by_field_name("target") != Some(node))
+            && !in_elixir_def_head(src, node);
         let name = match node.kind() {
             _ if plain => Some(text(node)),
             "call_expression" => node.child_by_field_name("function").and_then(last),
@@ -1096,9 +1189,22 @@ fn refs_in(src: &str, tree: &tree_sitter::Tree) -> Vec<Ref> {
                 node.child_by_field_name("name").and_then(last).filter(|n| n.starts_with(char::is_uppercase))
             }
             // skip the name in `interface Foo`, which def already covers
-            "type_identifier" if node.parent().and_then(def_name) != Some(node) => Some(text(node)),
-            // GDScript: foo(), obj.foo(), super.foo()
-            "call" | "attribute_call" | "base_call" => node.named_child(0).filter(|n| n.kind() == "identifier").map(text),
+            "type_identifier" if node.parent().and_then(|p| def_name(src, p)) != Some(node) => Some(text(node)),
+            // Elixir: foo(), Mod.foo(), &foo/2 and %Struct{}; `def foo` itself is a call too, skipped
+            "call" if node.child_by_field_name("target").is_some() => match node.child_by_field_name("target") {
+                Some(t) if t.kind() == "identifier" && elixir_def(src, node).is_none() && !in_elixir_def_head(src, node) => Some(text(t)),
+                Some(t) if t.kind() == "dot" => t.named_child(1).filter(|n| n.kind() == "identifier").map(text),
+                _ => None,
+            },
+            "binary_operator" if node.parent().map_or(false, |p| p.kind() == "unary_operator" && src[p.byte_range()].starts_with('&')) => {
+                node.named_child(0).filter(|n| n.kind() == "identifier").map(text)
+            }
+            // GDScript: foo(), obj.foo(), super.foo(). Erlang: foo(), mod:foo() (atom)
+            "call" | "attribute_call" | "base_call" => node.named_child(0).filter(|n| matches!(n.kind(), "identifier" | "atom")).map(text),
+            // Erlang: fun foo/2, #rec{}, R#rec.f, ?MACRO
+            "internal_fun" => node.named_child(0).filter(|n| n.kind() == "atom").map(text),
+            "record_name" => Some(text(node).trim_start_matches('#').to_string()),
+            "macro_call_expr" => node.named_child(0).map(text),
             _ => None,
         };
         if let Some(name) = name {
@@ -1111,7 +1217,12 @@ fn refs_in(src: &str, tree: &tree_sitter::Tree) -> Vec<Ref> {
                 text: lines.get(row).unwrap_or(&"").trim().chars().take(160).collect(),
             });
         }
-        let inner = def_name(node).map_or(caller, |n| src[n.byte_range()].into());
+        // Erlang: every clause names its function, even the ones def_name folds into the first
+        let inner = match node.kind() {
+            "function_clause" => node.named_child(0).map_or(caller, |n| src[n.byte_range()].into()),
+            "call" => elixir_head_name(src, node).map_or(caller, |n| src[n.byte_range()].into()),
+            _ => def_name(src, node).map_or(caller, |n| src[n.byte_range()].into()),
+        };
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             stack.push((child, inner.clone()));
@@ -1333,6 +1444,70 @@ mod tests {
         let r = refs(src, tree_sitter_gdscript::LANGUAGE.into());
         let got: Vec<_> = r.iter().filter(|r| !r.plain).map(|r| (r.name.as_str(), r.line, r.caller.as_str())).collect();
         assert_eq!(got, vec![("spawn", 2, "_ready"), ("hit", 3, "_ready"), ("init", 4, "_ready")]);
+    }
+
+    #[test]
+    fn elixir_symbols_and_refs() {
+        let src = r#"defmodule Circles.Rooms do
+  use GenServer
+  @spec join(binary(), map()) :: {:ok, term()}
+  def join(room_id, user) when is_map(user) do
+    Repo.get!(Room, room_id) |> validate(user)
+    %Room{id: id} = fetch_room(room_id)
+    Enum.map(ids, &validate/1)
+  end
+  defp validate(room, _user), do: room
+  defp validate(nil, _user), do: nil
+  defmacro __using__(_), do: nil
+  defguard is_room(x) when is_map(x)
+  defdelegate count(q), to: Repo
+  defimpl Inspect, for: Room do
+  end
+end
+"#;
+        let lang: tree_sitter::Language = tree_sitter_elixir::LANGUAGE.into();
+        let mut s = symbols(src, lang.clone());
+        s.sort_by_key(|s| s.line);
+        let kinds: Vec<(&str, &str)> = s.iter().map(|s| (s.name.as_str(), s.kind.as_str())).collect();
+        assert_eq!(
+            kinds,
+            [
+                ("Circles.Rooms", "module"),
+                ("join", "function"),
+                ("validate", "private function"),
+                ("__using__", "macro"),
+                ("is_room", "guard"),
+                ("count", "delegate"),
+                ("Inspect", "impl"),
+            ]
+        );
+        assert_eq!(s[1].signature, "def join(room_id, user) when is_map(user) do");
+        let r = refs(src, lang);
+        let at = |n: &str| r.iter().filter(|x| x.name == n).map(|x| (x.line, x.caller.as_str())).collect::<Vec<_>>();
+        assert_eq!(at("validate"), [(5, "join"), (7, "join")], "call and &validate/1; the defp is not a use");
+        assert_eq!(at("get!"), [(5, "join")]);
+        assert_eq!(at("Room"), [(5, "join"), (6, "join"), (14, "Inspect")], "argument, %Room{{}}, defimpl for:");
+        assert_eq!(at("Repo"), [(5, "join"), (13, "count")]);
+        assert_eq!(at("GenServer"), [(2, "Circles.Rooms")]);
+        assert!(at("Circles.Rooms").is_empty() && at("Inspect").is_empty(), "module and defimpl names are definitions");
+        assert!(at("def").is_empty() && at("defp").is_empty(), "def keywords are not calls");
+        assert_eq!(at("join"), [(3, "Circles.Rooms")], "the @spec, not the def");
+    }
+
+    #[test]
+    fn erlang_symbols_and_refs() {
+        let src = "-module(rooms).\n-record(room, {id, name}).\n-define(TIMEOUT, 5000).\n-type t() :: ok.\njoin(RoomId, User) ->\n  Room = rooms_db:get(RoomId),\n  validate(Room, User, ?TIMEOUT);\njoin(_, _) ->\n  #room{id = 1}.\nvalidate(_R, _U, _T) -> ok.\n";
+        let lang: tree_sitter::Language = tree_sitter_erlang::LANGUAGE.into();
+        let mut s = symbols(src, lang.clone());
+        s.sort_by_key(|s| s.line);
+        let kinds: Vec<(&str, &str)> = s.iter().map(|s| (s.name.as_str(), s.kind.as_str())).collect();
+        assert_eq!(kinds, [("room", "record"), ("TIMEOUT", "macro"), ("t", "type alias"), ("join", "function"), ("validate", "function")]);
+        let r = refs(src, lang);
+        let at = |n: &str| r.iter().filter(|x| x.name == n).map(|x| (x.line, x.caller.as_str())).collect::<Vec<_>>();
+        assert_eq!(at("validate"), [(7, "join")]);
+        assert_eq!(at("get"), [(6, "join")]);
+        assert_eq!(at("room"), [(9, "join")]);
+        assert_eq!(at("TIMEOUT"), [(7, "join")]);
     }
 
     #[test]

@@ -89,6 +89,8 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tree-sitter",
+ "tree-sitter-elixir",
+ "tree-sitter-erlang",
  "tree-sitter-gdscript",
  "tree-sitter-typescript",
 ]
@@ -519,6 +521,26 @@ dependencies = [
  "regex-syntax",
  "serde_json",
  "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-elixir"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66dd064a762ed95bfc29857fa3cb7403bb1e5cb88112de0f6341b7e47284ba40"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-erlang"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8079a9cfe733c3b6749bb3c683c0e997ee68a2305f7a210800bbbc53e82d3f64"
+dependencies = [
+ "cc",
  "tree-sitter-language",
 ]
 

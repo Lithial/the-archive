@@ -164,7 +164,7 @@ The saving is an estimate and an upper bound: tokens are bytes/4, and it assumes
 - Respects `.gitignore`. To leave out tracked folders like vendor code, add a `.archiveignore` in the repo root with the same syntax (`vendor/`, `third_party/`, `*.min.js`). Editing it triggers a rebuild on the next query.
 - Identifiers and paths are split (`useRemovePerson.ts` → `use Remove Person`) so plain-English queries hit file and symbol names.
 - Test, story and fixture files rank at 0.8× so the implementation wins a tie.
-- `def` uses tree-sitter. TypeScript, JavaScript and GDScript so far; another language is a grammar crate and a few node names.
+- `def` uses tree-sitter. TypeScript, JavaScript, GDScript, Elixir and Erlang so far; another language is a grammar crate and a few node names. Multi-clause Elixir and Erlang functions are one symbol, at the first clause.
 - The index lives in `~/.cache/archive/<path>.db`. Every `search`/`def`/`refs`/MCP call first compares each file's mtime and size with what was indexed, then reindexes only the files that changed and drops deleted ones. On a 4k-file repo the check is ~60 ms and a query right after editing a file is 100–200 ms. A branch switch touching more than 300 files, or a change to `.archiveignore`/`.archivedeps`, triggers a full rebuild instead (~3.5 s; files are parsed on every core). `archive index` forces a full rebuild.
 
 ## What it doesn't do
